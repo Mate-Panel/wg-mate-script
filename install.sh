@@ -1,6 +1,6 @@
 #!/bin/bash
 
-SCRIPT_VERSION="0.1"
+SCRIPT_VERSION="0.2"
 GIT_REPO="Mate-Panel/wg-mate-script"
 SCRIPT_URL="https://raw.githubusercontent.com/${GIT_REPO}/main/install.sh"
 SCRIPT_API_URL="https://api.github.com/repos/${GIT_REPO}/contents/install.sh?ref=main"
@@ -71,6 +71,7 @@ _step_eta() {
         "Creating directories"*)             echo 3   ;;
         "Writing environment file"*)         echo 3   ;;
         "Writing compose file"*)             echo 3   ;;
+        "Installing host helpers"*)          echo 35  ;;
         "Installing the wg-mate command"*)   echo 4   ;;
         "Pulling images"*)                   echo 180 ;;
         "Starting containers"*)              echo 30  ;;
@@ -97,7 +98,7 @@ plan_eta() {
             STEP_TOTAL=$((STEP_TOTAL + 6)); ETA_REMAINING=$((ETA_REMAINING + 200))
         fi
     fi
-    phase_done CONFIG || { STEP_TOTAL=$((STEP_TOTAL + 4)); ETA_REMAINING=$((ETA_REMAINING + 13));  }
+    phase_done CONFIG || { STEP_TOTAL=$((STEP_TOTAL + 5)); ETA_REMAINING=$((ETA_REMAINING + 48));  }
     phase_done IMAGES || { STEP_TOTAL=$((STEP_TOTAL + 1)); ETA_REMAINING=$((ETA_REMAINING + 180)); }
     phase_done START  || { STEP_TOTAL=$((STEP_TOTAL + 2)); ETA_REMAINING=$((ETA_REMAINING + 75));  }
 }
@@ -1148,6 +1149,443 @@ psql_do() {
 
 backup_dir() { printf '%s/backups' "$APP_DIR"; }
 
+install_host_helpers() {
+    local sslsh="$APP_DIR/scripts/panel-ssl-apply.sh"
+    local netsh="$APP_DIR/scripts/panel-net-apply.sh"
+    if ! have nginx; then
+        have apt-get || return 1
+        DEBIAN_FRONTEND=noninteractive apt-get install -y -o DPkg::Lock::Timeout=180 nginx >/dev/null 2>&1 || return 1
+    fi
+    mkdir -p "$APP_DIR/scripts"
+    cat > "$sslsh" <<'WGMATE_PANEL_SSL_APPLY_SH_EOF'
+#!/usr/bin/env bash
+# Turns ssl-vhosts.json into host nginx TLS vhosts (panel + sub domains).
+# Each cert entry may specify httpsPort (443, 4443, 9990, …). ACME HTTP-01
+# still needs public :80. Triggered by wg-mate-panel-ssl.path.
+set -euo pipefail
+
+DATA="${PANEL_DATA_DIR:-/opt/wg-mate/data/panel}"
+MANIFEST="$DATA/ssl-vhosts.json"
+CERTS="$DATA/certs"
+NGINX_AVAIL="${NGINX_AVAIL:-/etc/nginx/sites-available}"
+NGINX_ENABLED="${NGINX_ENABLED:-/etc/nginx/sites-enabled}"
+INTERNAL_PORT="${PANEL_INTERNAL_PORT:-3000}"
+if [ -f "$DATA/ssl.env" ]; then
+  set -a
+  # shellcheck disable=SC1090,SC1091
+  . "$DATA/ssl.env"
+  set +a
+fi
+WEBROOT="$DATA/acme-webroot"
+CHALLENGES="$DATA/acme-challenge.txt"
+PREFIX="wg-mate-ssl-"
+ACME_PREFIX="wg-mate-acme-"
+LOG="${PANEL_SSL_LOG:-/var/log/wg-mate-panel-ssl.log}"
+ACME_HTTP_PORTS="${PANEL_ACME_HTTP_PORTS:-80,8080,8081,8880}"
+ACME_PORT_FILE="$DATA/acme-http-port.txt"
+
+log() { echo "$(date -Is) $*" >>"$LOG" 2>/dev/null || true; }
+
+ensure_traversable() {
+  local d="$1"
+  while [ -n "$d" ] && [ "$d" != "/" ] && [ "$d" != "." ]; do
+    chmod a+x "$d" 2>/dev/null || true
+    d="$(dirname "$d")"
+  done
+}
+
+port_owner() {
+  local p="$1" out=""
+  out="$(ss -lntpH "sport = :$p" 2>/dev/null || true)"
+  if [ -z "$out" ]; then
+    out="$(ss -lntp 2>/dev/null | awk -v pat=":$p$" '$4 ~ pat' || true)"
+  fi
+  printf '%s' "$out" | tr -s ' '
+}
+
+port_usable() {
+  local owner
+  owner="$(port_owner "$1")"
+  [ -n "$owner" ] || return 0
+  case "$owner" in *nginx*) return 0 ;; esac
+  return 1
+}
+
+pick_acme_ports() {
+  local p out=""
+  IFS=',' read -r -a _cand <<< "$ACME_HTTP_PORTS"
+  for p in "${_cand[@]}"; do
+    p="$(echo "$p" | tr -d '[:space:]')"
+    [ -n "$p" ] || continue
+    [[ "$p" =~ ^[0-9]+$ ]] || continue
+    [ "$p" -ge 1 ] && [ "$p" -le 65535 ] || continue
+    case "$p" in 22|25|53) continue ;; esac
+    if port_usable "$p"; then
+      out="$out $p"
+    else
+      log "ACME port $p is taken by: $(port_owner "$p")"
+    fi
+  done
+  printf '%s' "${out# }"
+}
+
+acme_listen_lines() {
+  local lines="" p
+  for p in $ACME_PORTS; do
+    lines="${lines}    listen ${p};
+    listen [::]:${p};
+"
+  done
+  printf '%s' "$lines"
+}
+
+acme_server_block() {
+  local domain="$1" fallback="$2" lines
+  lines="$(acme_listen_lines)"
+  [ -n "$lines" ] || return 0
+  printf 'server {\n%s\n    server_name %s;\n    location /.well-known/acme-challenge/ { root %s; }\n%s\n}\n' \
+    "$lines" "$domain" "$WEBROOT" "$fallback"
+}
+
+[ -f "$MANIFEST" ] || { log "no manifest at $MANIFEST"; exit 0; }
+
+chmod 755 "$DATA" 2>/dev/null || true
+mkdir -p "$WEBROOT" "$CERTS"
+ensure_traversable "$WEBROOT"
+chmod -R a+rX "$WEBROOT" 2>/dev/null || true
+chmod 755 "$CERTS" 2>/dev/null || true
+find "$CERTS" -type d -exec chmod 755 {} \; 2>/dev/null || true
+find "$CERTS" -name 'fullchain.pem' -exec chmod 644 {} \; 2>/dev/null || true
+find "$CERTS" -name 'privkey.pem' -exec chmod 640 {} \; 2>/dev/null || true
+if getent group www-data >/dev/null 2>&1; then
+  find "$CERTS" -name 'privkey.pem' -exec chgrp www-data {} \; 2>/dev/null || true
+fi
+
+ACME_PORTS="$(pick_acme_ports)"
+printf '%s\n' "$(echo "$ACME_PORTS" | tr ' ' ',')" >"$ACME_PORT_FILE"
+chmod 644 "$ACME_PORT_FILE" 2>/dev/null || true
+if [ -z "$ACME_PORTS" ]; then
+  log "no usable ACME HTTP port among [$ACME_HTTP_PORTS] — challenge vhosts disabled"
+else
+  case " $ACME_PORTS " in
+    *" 80 "*) log "ACME HTTP-01 will use port 80 (plus: ${ACME_PORTS#80})" ;;
+    *) log "port 80 is busy — ACME challenge vhost falls back to [$ACME_PORTS]; Let's Encrypt still validates on public :80" ;;
+  esac
+fi
+
+TMP="$(mktemp -d)"
+cp -a "$NGINX_AVAIL/${PREFIX}"* "$NGINX_AVAIL/${ACME_PREFIX}"* "$TMP/" 2>/dev/null || true
+
+want=""
+https_ports_used=""
+
+# Emit one vhost per hostname. Panel+sub may share a domain (and port); ports
+# are unioned into a single TLS server block.
+while IFS='|' read -r d ports || [ -n "${d:-}" ]; do
+  [ -n "${d:-}" ] || continue
+  [[ "$d" =~ ^[A-Za-z0-9.-]+$ ]] || { log "skip invalid domain '$d'"; continue; }
+
+  cert="$CERTS/$d/fullchain.pem"; key="$CERTS/$d/privkey.pem"
+  [ -s "$cert" ] && [ -s "$key" ] || { log "missing cert files for $d"; continue; }
+
+  listen_tls=""
+  primary_port=""
+  for https_port in $ports; do
+    [[ "$https_port" =~ ^[0-9]+$ ]] || continue
+    [ "$https_port" -ge 1 ] && [ "$https_port" -le 65535 ] || continue
+    listen_tls="${listen_tls}    listen ${https_port} ssl;
+    listen [::]:${https_port} ssl;
+"
+    https_ports_used="$https_ports_used $https_port"
+    [ -n "$primary_port" ] || primary_port="$https_port"
+  done
+  [ -n "$listen_tls" ] || { log "no valid https ports for $d"; continue; }
+
+  redir_host="\$host"
+  case " $ports " in
+    *" 443 "*) ;;
+    *) [ -n "$primary_port" ] && [ "$primary_port" != "443" ] && redir_host="\$host:${primary_port}" ;;
+  esac
+
+  want="$want $d"
+
+  acme_block="$(acme_server_block "$d" "    location / { return 301 https://${redir_host}\$request_uri; }")"
+
+  cat >"$NGINX_AVAIL/${PREFIX}${d}" <<EOF
+${acme_block}
+server {
+${listen_tls}    server_name ${d};
+    ssl_certificate     ${cert};
+    ssl_certificate_key ${key};
+    client_max_body_size 128m;
+    proxy_read_timeout 300s;
+    proxy_send_timeout 300s;
+
+    location / {
+        proxy_pass         http://127.0.0.1:${INTERNAL_PORT};
+        proxy_http_version 1.1;
+        proxy_set_header   Upgrade \$http_upgrade;
+        proxy_set_header   Connection 'upgrade';
+        proxy_set_header   Host \$host;
+        proxy_set_header   X-Real-IP \$remote_addr;
+        proxy_set_header   X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header   X-Forwarded-Proto \$scheme;
+        proxy_set_header   X-Forwarded-Host \$http_host;
+        proxy_cache_bypass \$http_upgrade;
+        proxy_request_buffering off;
+    }
+}
+EOF
+  ln -sf "$NGINX_AVAIL/${PREFIX}${d}" "$NGINX_ENABLED/${PREFIX}${d}"
+done < <(python3 - "$MANIFEST" <<'PY'
+import json, sys
+path = sys.argv[1]
+try:
+    data = json.load(open(path, encoding="utf-8"))
+except Exception:
+    sys.exit(0)
+by_domain = {}
+for c in data.get("certs") or []:
+    d = (c.get("domain") or "").strip()
+    if not d:
+        continue
+    p = c.get("httpsPort") or 4443
+    try:
+        p = int(p)
+    except Exception:
+        p = 4443
+    ports = by_domain.setdefault(d, [])
+    if p not in ports:
+        ports.append(p)
+for d, ports in by_domain.items():
+    print(d + "|" + " ".join(str(p) for p in ports))
+PY
+)
+
+challenging=""
+if [ -f "$CHALLENGES" ]; then
+  while IFS= read -r d || [ -n "$d" ]; do
+    d="$(echo "$d" | tr -d '[:space:]')"
+    [ -n "$d" ] || continue
+    [[ "$d" =~ ^[A-Za-z0-9.-]+$ ]] || continue
+    case " $want " in *" $d "*) continue ;; esac
+    if [ -z "$ACME_PORTS" ]; then
+      log "no free HTTP port for the ACME challenge of $d — skipping challenge vhost"
+      continue
+    fi
+    challenging="$challenging $d"
+    acme_server_block "$d" "    location / { return 404; }" >"$NGINX_AVAIL/${ACME_PREFIX}${d}"
+    ln -sf "$NGINX_AVAIL/${ACME_PREFIX}${d}" "$NGINX_ENABLED/${ACME_PREFIX}${d}"
+  done < "$CHALLENGES"
+fi
+
+for f in "$NGINX_ENABLED/${PREFIX}"* "$NGINX_AVAIL/${PREFIX}"*; do
+  [ -e "$f" ] || continue
+  base="$(basename "$f")"; dom="${base#$PREFIX}"
+  case " $want " in *" $dom "*) : ;; *) rm -f "$f"; log "removed stale vhost $base" ;; esac
+done
+for f in "$NGINX_ENABLED/${ACME_PREFIX}"* "$NGINX_AVAIL/${ACME_PREFIX}"*; do
+  [ -e "$f" ] || continue
+  base="$(basename "$f")"; dom="${base#$ACME_PREFIX}"
+  case " $challenging " in *" $dom "*) : ;; *) rm -f "$f"; log "removed challenge vhost $base" ;; esac
+done
+
+rollback() {
+  rm -f "$NGINX_ENABLED/${PREFIX}"* "$NGINX_AVAIL/${PREFIX}"* "$NGINX_ENABLED/${ACME_PREFIX}"* "$NGINX_AVAIL/${ACME_PREFIX}"*
+  if compgen -G "$TMP/*" >/dev/null; then
+    cp -a "$TMP/"* "$NGINX_AVAIL/" 2>/dev/null || true
+    for f in "$NGINX_AVAIL/${PREFIX}"* "$NGINX_AVAIL/${ACME_PREFIX}"*; do
+      [ -e "$f" ] && ln -sf "$f" "$NGINX_ENABLED/$(basename "$f")"
+    done
+  fi
+  systemctl reload nginx >>"$LOG" 2>&1 || true
+  rm -rf "$TMP"
+}
+
+if ! nginx -t >>"$LOG" 2>&1; then
+  rollback
+  log "nginx -t FAILED — rolled back vhosts"
+  exit 1
+fi
+if ! systemctl reload nginx >>"$LOG" 2>&1; then
+  rollback
+  log "nginx reload FAILED — rolled back vhosts"
+  exit 1
+fi
+
+# Confirm each distinct HTTPS port is listening when we have TLS vhosts.
+if [ -n "$(echo "$want" | tr -d '[:space:]')" ]; then
+  seen_ports=" "
+  for hp in $https_ports_used; do
+    case "$seen_ports" in *" $hp "*) continue ;; esac
+    seen_ports="${seen_ports}${hp} "
+    ok=0
+    for _ in 1 2 3 4 5 6 7 8; do
+      if ss -lnt 2>/dev/null | grep -qE ":${hp}\\b"; then ok=1; break; fi
+      sleep 0.25
+    done
+    if [ "$ok" -ne 1 ]; then
+      log "HTTPS :${hp} not listening after reload — rolling back (is the port free?)"
+      rollback
+      exit 1
+    fi
+  done
+fi
+
+log "applied vhosts — tls:${want:- none} ports:${https_ports_used:- none} challenge:${challenging:- none} acme-http:${ACME_PORTS:- none}"
+rm -rf "$TMP"
+WGMATE_PANEL_SSL_APPLY_SH_EOF
+
+    cat > "$netsh" <<'WGMATE_PANEL_NET_APPLY_SH_EOF'
+#!/usr/bin/env bash
+# Applies the panel's chosen PUBLIC port to the host nginx vhost, safely.
+# Triggered by the wg-mate-panel-net.path systemd unit whenever the api writes
+# /opt/wg-mate/data/panel/panel-net.json. Validates with `nginx -t` and rolls
+# back on any failure, so a bad value can never take the panel (or other sites)
+# down. The firewall is left untouched unless ufw is active.
+set -euo pipefail
+
+INTENT="${PANEL_NET_FILE:-/opt/wg-mate/data/panel/panel-net.json}"
+VHOST="${PANEL_VHOST:-/etc/nginx/sites-available/wg-mate}"
+INTERNAL_PORT="${PANEL_INTERNAL_PORT:-3000}"
+LOG="${PANEL_NET_LOG:-/var/log/wg-mate-panel-net.log}"
+
+log() { echo "$(date -Is) $*" >>"$LOG" 2>/dev/null || true; }
+
+[ -f "$INTENT" ] || { log "no intent file at $INTENT"; exit 0; }
+[ -f "$VHOST" ] || { log "vhost $VHOST missing"; exit 0; }
+
+port="$(grep -oE '"panelPort"[[:space:]]*:[[:space:]]*[0-9]+' "$INTENT" | grep -oE '[0-9]+$' | head -1 || true)"
+[ -n "${port:-}" ] || { log "no panelPort in $INTENT"; exit 0; }
+
+if ! [[ "$port" =~ ^[0-9]+$ ]] || [ "$port" -lt 1 ] || [ "$port" -gt 65535 ]; then
+  log "invalid port '$port' — ignoring"; exit 0
+fi
+if [ "$port" -eq "$INTERNAL_PORT" ]; then
+  log "port $port collides with internal web port — ignoring"; exit 0
+fi
+case "$port" in
+  22|25|53|465|587|993|995|3000|3306|5432|5433|6379|8081|9443|52653)
+    log "port $port is reserved — ignoring"; exit 0 ;;
+esac
+
+https_ports=""
+if [ -f "${PANEL_DATA_DIR:-/opt/wg-mate/data/panel}/ssl.env" ]; then
+  https="$(grep -E '^PANEL_HTTPS_PORT=' "${PANEL_DATA_DIR:-/opt/wg-mate/data/panel}/ssl.env" | head -1 | cut -d= -f2 | tr -d '[:space:]' || true)"
+  [ -n "$https" ] && https_ports="$https_ports $https"
+fi
+if [ -f "${PANEL_DATA_DIR:-/opt/wg-mate/data/panel}/ssl-vhosts.json" ]; then
+  while IFS= read -r hp; do
+    [ -n "$hp" ] && https_ports="$https_ports $hp"
+  done < <(python3 - "${PANEL_DATA_DIR:-/opt/wg-mate/data/panel}/ssl-vhosts.json" <<'PY' 2>/dev/null || true
+import json, sys
+try:
+    data = json.load(open(sys.argv[1], encoding="utf-8"))
+except Exception:
+    raise SystemExit(0)
+for c in data.get("certs") or []:
+    try:
+        print(int(c.get("httpsPort") or 0))
+    except Exception:
+        pass
+PY
+)
+fi
+for hp in $https_ports; do
+  if [ "$port" = "$hp" ]; then
+    log "port $port is the SSL HTTPS port — applying HTTP on 80 instead"
+    port=80
+    break
+  fi
+done
+
+cur="$(grep -oE 'listen[[:space:]]+[0-9]+' "$VHOST" | grep -oE '[0-9]+' | head -1 || true)"
+if [ "$cur" = "$port" ]; then
+  log "public port already $port — nothing to do"; exit 0
+fi
+
+BAK="$VHOST.bak.panel-net"
+cp -a "$VHOST" "$BAK"
+# Rewrite ONLY the current panel-port listen lines, so a `listen 80;` redirect or
+# any other block in the same file is never touched.
+sed -i -E "s/listen[[:space:]]+${cur};/listen $port;/; s/listen[[:space:]]+\[::\]:${cur};/listen [::]:$port;/" "$VHOST"
+
+if nginx -t >>"$LOG" 2>&1 && systemctl reload nginx >>"$LOG" 2>&1; then
+  log "applied public port $port (was ${cur:-unknown})"
+  # Best-effort firewall: only if ufw is active.
+  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status: active'; then
+    ufw allow "$port"/tcp >>"$LOG" 2>&1 || true
+    [ -n "${cur:-}" ] && [ "$cur" != "$port" ] && ufw delete allow "$cur"/tcp >>"$LOG" 2>&1 || true
+  fi
+else
+  cp -a "$BAK" "$VHOST"
+  systemctl reload nginx >>"$LOG" 2>&1 || true
+  log "nginx validation/reload FAILED — reverted to ${cur:-previous}"
+  exit 1
+fi
+WGMATE_PANEL_NET_APPLY_SH_EOF
+
+    chmod 755 "$sslsh" "$netsh"
+    cat > "/etc/systemd/system/wg-mate-panel-ssl.service" <<'WGMATE_WG_MATE_PANEL_SSL_SERVICE_EOF'
+[Unit]
+Description=Apply wg-mate SSL certificates to nginx
+After=nginx.service
+
+[Service]
+Type=oneshot
+# Optional overrides in /opt/wg-mate/data/panel/ssl.env, e.g.:
+#   PANEL_HTTPS_PORT=4443          # default; never use 443 (often x-ui/xray)
+#   PANEL_ACME_HTTP_PORTS=80,8080  # LE needs :80
+#   PANEL_HTTPS_CANDIDATES=4443,8443,9444,10443
+EnvironmentFile=-/opt/wg-mate/data/panel/ssl.env
+ExecStart=/opt/wg-mate/scripts/panel-ssl-apply.sh
+WGMATE_WG_MATE_PANEL_SSL_SERVICE_EOF
+
+    cat > "/etc/systemd/system/wg-mate-panel-ssl.path" <<'WGMATE_WG_MATE_PANEL_SSL_PATH_EOF'
+[Unit]
+Description=Watch wg-mate SSL artifacts and apply TLS/ACME vhosts to nginx
+
+[Path]
+PathModified=/opt/wg-mate/data/panel/ssl-vhosts.json
+PathModified=/opt/wg-mate/data/panel/acme-challenge.txt
+Unit=wg-mate-panel-ssl.service
+
+[Install]
+WantedBy=multi-user.target
+WGMATE_WG_MATE_PANEL_SSL_PATH_EOF
+
+    cat > "/etc/systemd/system/wg-mate-panel-net.service" <<'WGMATE_WG_MATE_PANEL_NET_SERVICE_EOF'
+[Unit]
+Description=Apply wg-mate panel public port to nginx
+After=nginx.service
+
+[Service]
+Type=oneshot
+ExecStart=/opt/wg-mate/scripts/panel-net-apply.sh
+WGMATE_WG_MATE_PANEL_NET_SERVICE_EOF
+
+    cat > "/etc/systemd/system/wg-mate-panel-net.path" <<'WGMATE_WG_MATE_PANEL_NET_PATH_EOF'
+[Unit]
+Description=Watch wg-mate panel-net.json and apply the public port to nginx
+
+[Path]
+PathModified=/opt/wg-mate/data/panel/panel-net.json
+Unit=wg-mate-panel-net.service
+
+[Install]
+WantedBy=multi-user.target
+WGMATE_WG_MATE_PANEL_NET_PATH_EOF
+
+    if [ -e /etc/nginx/sites-enabled/default ] && ss -lntpH 'sport = :80' 2>/dev/null | grep -qv nginx; then
+        rm -f /etc/nginx/sites-enabled/default
+    fi
+    systemctl daemon-reload >/dev/null 2>&1
+    systemctl enable --now nginx >/dev/null 2>&1
+    systemctl enable --now wg-mate-panel-ssl.path wg-mate-panel-net.path >/dev/null 2>&1
+    systemctl start wg-mate-panel-ssl.service wg-mate-panel-net.service >/dev/null 2>&1
+    return 0
+}
+
 create_directories() {
     mkdir -p "$APP_DIR/data/xray" "$APP_DIR/data/openvpn" "$APP_DIR/data/panel" "$(backup_dir)"
 }
@@ -1920,6 +2358,9 @@ function install_panel() {
         run_step "Writing compose file" "write_compose" \
             || { show_step_error; install_pause "Writing compose file"; }
 
+        run_step "Installing host helpers (nginx + ACME watchers)" "install_host_helpers" \
+            || _warn "Could not install the nginx host helpers - the SSL page will not be able to issue certificates."
+
         write_bootstrap_admin
 
         run_step "Installing the wg-mate command" "install_command" \
@@ -1980,7 +2421,7 @@ function update_panel() {
         [ "$rc" -ne 0 ] && { _back_to_menu; return 1; }
     fi
 
-    STEP_TOTAL=4; STEP_NO=0; ETA_REMAINING=0
+    STEP_TOTAL=5; STEP_NO=0; ETA_REMAINING=0
     print_header "Updating ${APP_NAME}"
 
     env_set WG_MATE_CHANNEL "$IMAGE_TAG"
@@ -1988,6 +2429,9 @@ function update_panel() {
 
     run_step "Writing compose file" "write_compose" \
         || { show_step_error; _back_to_menu; return 1; }
+
+    run_step "Installing host helpers (nginx + ACME watchers)" "install_host_helpers" \
+        || _warn "Could not install the nginx host helpers - the SSL page will not be able to issue certificates."
 
     run_step "Installing the wg-mate command" "install_command" \
         || _warn "Could not refresh the ${APP_NAME} command."
