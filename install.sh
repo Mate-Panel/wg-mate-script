@@ -1,6 +1,6 @@
 #!/bin/bash
 
-SCRIPT_VERSION="0.2"
+SCRIPT_VERSION="0.2.1"
 GIT_REPO="Mate-Panel/wg-mate-script"
 SCRIPT_URL="https://raw.githubusercontent.com/${GIT_REPO}/main/install.sh"
 SCRIPT_API_URL="https://api.github.com/repos/${GIT_REPO}/contents/install.sh?ref=main"
@@ -718,6 +718,105 @@ compose() {
         echo "docker compose plugin not found" >&2
         return 1
     fi
+}
+
+DOCKER_HUB_MIRRORS="docker.arvancloud.ir hub.hamdocker.ir"
+PULL_CACHED_FILE="$RUNTIME_DIR/pull_cached"
+PULL_MISSING_FILE="$RUNTIME_DIR/pull_missing"
+
+image_present() {
+    docker image inspect "$1" >/dev/null 2>&1
+}
+
+is_hub_image() {
+    case "$1" in
+        *.*/*|localhost/*) return 1 ;;
+        *) return 0 ;;
+    esac
+}
+
+hub_mirror_refs() {
+    local ref="$1" path="$1" m
+    case "$ref" in
+        */*) : ;;
+        *) path="library/$ref" ;;
+    esac
+    for m in $DOCKER_HUB_MIRRORS; do
+        printf '%s/%s\n' "$m" "$path"
+    done
+}
+
+pull_log_is_fatal() {
+    grep -qiE 'manifest unknown|manifest for .* not found|not found: manifest|repository does not exist|unauthorized|denied|access to the resource is denied' "$1"
+}
+
+pull_image_ref() {
+    local ref="$1" attempt=0 mref out
+    out="$(mktemp)"
+    while [ "$attempt" -lt 3 ]; do
+        attempt=$((attempt + 1))
+        echo "pulling $ref (attempt ${attempt}/3)"
+        if docker pull "$ref" >"$out" 2>&1; then
+            cat "$out"; rm -f "$out"
+            return 0
+        fi
+        cat "$out"
+        if pull_log_is_fatal "$out"; then
+            rm -f "$out"
+            return 2
+        fi
+        sleep $((attempt * 4))
+    done
+    if is_hub_image "$ref"; then
+        for mref in $(hub_mirror_refs "$ref"); do
+            echo "pulling $ref through mirror $mref"
+            if docker pull "$mref" >"$out" 2>&1; then
+                cat "$out"
+                if docker tag "$mref" "$ref"; then
+                    rm -f "$out"
+                    return 0
+                fi
+            else
+                cat "$out"
+            fi
+        done
+    fi
+    rm -f "$out"
+    return 1
+}
+
+pull_images() {
+    local refs=("${API_IMAGE}:${IMAGE_TAG}" "${WEB_IMAGE}:${IMAGE_TAG}" "$DB_IMAGE")
+    local ref rc cached="" missing=""
+    : > "$PULL_CACHED_FILE"
+    : > "$PULL_MISSING_FILE"
+    for ref in "${refs[@]}"; do
+        pull_image_ref "$ref"
+        rc=$?
+        [ "$rc" -eq 0 ] && continue
+        if [ "$rc" -eq 2 ]; then
+            echo "image $ref does not exist in the registry"
+            missing="$missing $ref"
+        elif image_present "$ref"; then
+            echo "could not refresh $ref - keeping the copy already on this server"
+            cached="$cached $ref"
+        else
+            echo "could not download $ref and this server has no local copy"
+            missing="$missing $ref"
+        fi
+    done
+    printf '%s' "${cached# }" > "$PULL_CACHED_FILE"
+    printf '%s' "${missing# }" > "$PULL_MISSING_FILE"
+    [ -n "$missing" ] && return 1
+    return 0
+}
+
+report_pull_fallback() {
+    local cached=""
+    [ -f "$PULL_CACHED_FILE" ] && cached="$(cat "$PULL_CACHED_FILE" 2>/dev/null)"
+    [ -n "$cached" ] || return 0
+    _warn "Registry unreachable for: ${cached}"
+    _warn "Continued with the images already stored on this server."
 }
 
 port_pid() {
@@ -2371,8 +2470,9 @@ function install_panel() {
 
     if ! phase_done IMAGES; then
         print_header "Downloading Images"
-        run_step "Pulling images ($(channel_label "$IMAGE_TAG"))" "compose pull" \
+        run_step "Pulling images ($(channel_label "$IMAGE_TAG"))" "pull_images" \
             || { show_step_error; install_pause "Pulling images"; }
+        report_pull_fallback
         mark_phase IMAGES
     fi
 
@@ -2436,12 +2536,14 @@ function update_panel() {
     run_step "Installing the wg-mate command" "install_command" \
         || _warn "Could not refresh the ${APP_NAME} command."
 
-    if ! run_step "Pulling images ($(channel_label "$IMAGE_TAG"))" "compose pull"; then
+    if ! run_step "Pulling images ($(channel_label "$IMAGE_TAG"))" "pull_images"; then
         show_step_error
-        _bad "Could not pull ${IMAGE_TAG} - check that this tag exists, then retry."
+        _bad "Could not download: $(cat "$PULL_MISSING_FILE" 2>/dev/null)"
+        _bad "Check that the ${IMAGE_TAG} tag exists and that this server can reach ghcr.io / Docker Hub, then retry."
         _back_to_menu
         return 1
     fi
+    report_pull_fallback
 
     run_step "Recreating containers" "compose up -d" \
         || { show_step_error; _back_to_menu; return 1; }

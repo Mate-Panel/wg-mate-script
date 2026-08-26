@@ -163,22 +163,6 @@ An interrupted install is resumable: every finished phase (Docker, configuration
 
 ---
 
-## Ports and credentials
-
-The installer takes no environment variables at all — it asks for the panel web port and the admin account, and everything else is fixed in the script:
-
-| | |
-|---|---|
-| **API port** | `52653`, fixed — the images default to it, so there is nothing to configure |
-| **PostgreSQL** | bound to `127.0.0.1:5433` only, so it is not reachable from outside the server |
-| **Admin login** | asked during install and handed to the panel through a one-shot file, which the installer removes once the api is up — it is never stored in `.env` or in any container environment |
-| **Image tag** | the channel picked during install — `stable` (`latest`), `beta` (`dev`) or one pinned `vX.Y.Z`; it is stored in `.env` and changed from menu option 3. The panel version shown in the menu is read from the running api, not from the tag |
-
-Because the admin credentials are not stored on disk, a password is never recovered. Change it from
-inside the panel, under the admin account settings. The installer has no password-reset command.
-
----
-
 ## What gets installed
 
 ```
