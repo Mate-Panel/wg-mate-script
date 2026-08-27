@@ -1,6 +1,6 @@
 #!/bin/bash
 
-SCRIPT_VERSION="0.2.1"
+SCRIPT_VERSION="0.2.2"
 GIT_REPO="Mate-Panel/wg-mate-script"
 SCRIPT_URL="https://raw.githubusercontent.com/${GIT_REPO}/main/install.sh"
 SCRIPT_API_URL="https://api.github.com/repos/${GIT_REPO}/contents/install.sh?ref=main"
@@ -82,6 +82,7 @@ _step_eta() {
         "Creating the archive"*)             echo 12  ;;
         "Restoring the database"*)           echo 30  ;;
         "Restoring panel data"*)             echo 6   ;;
+        "Restoring WireGuard config"*)       echo 3   ;;
         "Removing containers"*)              echo 25  ;;
         "Removing images & volumes"*)        echo 25  ;;
         "Removing host helpers"*)            echo 6   ;;
@@ -1742,6 +1743,7 @@ services:
       - wg_data:/data
       - ./data/xray:/data/xray
       - ./data/openvpn:/etc/openvpn
+      - /etc/wireguard:/etc/wireguard
       - ./data/panel:/data/panel
       - /var/run/docker.sock:/var/run/docker.sock
       - /etc/machine-id:/host/etc/machine-id:ro
@@ -2785,7 +2787,7 @@ function backup_panel() {
         return 1
     fi
 
-    if ! run_step "Creating the archive" "tar -czf '${archive}' -C '${dir}' '$(basename "$sql")' -C '${APP_DIR}' .env docker-compose.yml data"; then
+    if ! run_step "Creating the archive" "tar -czf '${archive}' -C '${dir}' '$(basename "$sql")' -C '${APP_DIR}' .env docker-compose.yml data$([ -d /etc/wireguard ] && echo " -C / etc/wireguard")"; then
         show_step_error
         rm -f "$sql"
         _back_to_menu
@@ -2897,6 +2899,14 @@ function restore_panel() {
 
     if [ -d "$tmp/data" ]; then
         run_step "Restoring panel data" "cp -a '${tmp}/data/.' '${APP_DIR}/data/'" || show_step_error
+    fi
+    if [ -d "$tmp/etc/wireguard" ]; then
+        wg_iface="$(env_get WG_INTERFACE)"; wg_iface="${wg_iface:-wg0}"
+        run_step "Restoring WireGuard config" \
+            "mkdir -p /etc/wireguard && chmod 700 /etc/wireguard && cp -a '${tmp}/etc/wireguard/.' /etc/wireguard/ && (chmod 600 /etc/wireguard/*.conf 2>/dev/null || true) && \
+             { wg-quick down '${wg_iface}' >/dev/null 2>&1 || true; \
+               systemctl reset-failed 'wg-quick@${wg_iface}' >/dev/null 2>&1 || true; \
+               systemctl start 'wg-quick@${wg_iface}' >/dev/null 2>&1 || wg-quick up '${wg_iface}' >/dev/null 2>&1 || true; }" || show_step_error
     fi
     rm -rf "$tmp"
 
@@ -3054,6 +3064,8 @@ function purge_panel() {
             else
                 ip link del "$iface" >/dev/null 2>&1
             fi
+            systemctl disable --now "wg-quick@${iface}" >/dev/null 2>&1 || true
+            rm -f "/etc/wireguard/${iface}.conf"
             _ok "Interface ${iface} removed."
         fi
     fi
