@@ -1,6 +1,6 @@
 #!/bin/bash
 
-SCRIPT_VERSION="0.2.2"
+SCRIPT_VERSION="0.2.3"
 GIT_REPO="Mate-Panel/wg-mate-script"
 SCRIPT_URL="https://raw.githubusercontent.com/${GIT_REPO}/main/install.sh"
 SCRIPT_API_URL="https://api.github.com/repos/${GIT_REPO}/contents/install.sh?ref=main"
@@ -1269,12 +1269,18 @@ MANIFEST="$DATA/ssl-vhosts.json"
 CERTS="$DATA/certs"
 NGINX_AVAIL="${NGINX_AVAIL:-/etc/nginx/sites-available}"
 NGINX_ENABLED="${NGINX_ENABLED:-/etc/nginx/sites-enabled}"
-INTERNAL_PORT="${PANEL_INTERNAL_PORT:-3000}"
 if [ -f "$DATA/ssl.env" ]; then
   set -a
   # shellcheck disable=SC1090,SC1091
   . "$DATA/ssl.env"
   set +a
+fi
+INTERNAL_PORT="${PANEL_INTERNAL_PORT:-}"
+if ! [[ "${INTERNAL_PORT:-}" =~ ^[0-9]+$ ]] || [ "${INTERNAL_PORT:-0}" -lt 1 ] || [ "${INTERNAL_PORT:-0}" -gt 65535 ]; then
+  INTERNAL_PORT="$(grep -oE '"internalPort"[[:space:]]*:[[:space:]]*[0-9]+' "$DATA/panel-net.json" 2>/dev/null | grep -oE '[0-9]+$' | head -1 || true)"
+fi
+if ! [[ "${INTERNAL_PORT:-}" =~ ^[0-9]+$ ]] || [ "${INTERNAL_PORT:-0}" -lt 1 ] || [ "${INTERNAL_PORT:-0}" -gt 65535 ]; then
+  INTERNAL_PORT=3000
 fi
 WEBROOT="$DATA/acme-webroot"
 CHALLENGES="$DATA/acme-challenge.txt"
@@ -1285,6 +1291,7 @@ ACME_HTTP_PORTS="${PANEL_ACME_HTTP_PORTS:-80,8080,8081,8880}"
 ACME_PORT_FILE="$DATA/acme-http-port.txt"
 
 log() { echo "$(date -Is) $*" >>"$LOG" 2>/dev/null || true; }
+install -d -o root -g adm -m 755 /var/log/nginx 2>/dev/null || true
 
 ensure_traversable() {
   local d="$1"
@@ -1309,6 +1316,15 @@ port_usable() {
   [ -n "$owner" ] || return 0
   case "$owner" in *nginx*) return 0 ;; esac
   return 1
+}
+
+port_is_nginx() {
+  local owner
+  owner="$(port_owner "$1")"
+  [ -n "$owner" ] || return 1
+  case "$owner" in *nginx*) return 0 ;; esac
+  case "$owner" in *users:*) return 1 ;; esac
+  return 0
 }
 
 pick_acme_ports() {
@@ -1521,18 +1537,32 @@ if [ -n "$(echo "$want" | tr -d '[:space:]')" ]; then
     seen_ports="${seen_ports}${hp} "
     ok=0
     for _ in 1 2 3 4 5 6 7 8; do
-      if ss -lnt 2>/dev/null | grep -qE ":${hp}\\b"; then ok=1; break; fi
+      if port_is_nginx "$hp"; then ok=1; break; fi
       sleep 0.25
     done
     if [ "$ok" -ne 1 ]; then
-      log "HTTPS :${hp} not listening after reload — rolling back (is the port free?)"
+      log "HTTPS :${hp} is not served by nginx after reload (owner: $(port_owner "$hp")) — rolling back"
       rollback
       exit 1
     fi
   done
 fi
 
-log "applied vhosts — tls:${want:- none} ports:${https_ports_used:- none} challenge:${challenging:- none} acme-http:${ACME_PORTS:- none}"
+if [ -n "$(echo "$want" | tr -d '[:space:]')" ] && command -v curl >/dev/null 2>&1; then
+  upstream_ok=0
+  for _ in 1 2 3; do
+    if curl -fsS --max-time 3 "http://127.0.0.1:${INTERNAL_PORT}/healthz" >/dev/null 2>&1; then
+      upstream_ok=1
+      break
+    fi
+    sleep 1
+  done
+  if [ "$upstream_ok" -ne 1 ]; then
+    log "WARNING: upstream 127.0.0.1:${INTERNAL_PORT} does not answer /healthz — TLS vhosts are live but every request will 502 (owner: $(port_owner "$INTERNAL_PORT")); check WEB_PORT in .env and internalPort in $DATA/panel-net.json"
+  fi
+fi
+
+log "applied vhosts — tls:${want:- none} ports:${https_ports_used:- none} internal:${INTERNAL_PORT} challenge:${challenging:- none} acme-http:${ACME_PORTS:- none}"
 rm -rf "$TMP"
 WGMATE_PANEL_SSL_APPLY_SH_EOF
 
@@ -1547,13 +1577,18 @@ set -euo pipefail
 
 INTENT="${PANEL_NET_FILE:-/opt/wg-mate/data/panel/panel-net.json}"
 VHOST="${PANEL_VHOST:-/etc/nginx/sites-available/wg-mate}"
-INTERNAL_PORT="${PANEL_INTERNAL_PORT:-3000}"
 LOG="${PANEL_NET_LOG:-/var/log/wg-mate-panel-net.log}"
 
 log() { echo "$(date -Is) $*" >>"$LOG" 2>/dev/null || true; }
+install -d -o root -g adm -m 755 /var/log/nginx 2>/dev/null || true
 
 [ -f "$INTENT" ] || { log "no intent file at $INTENT"; exit 0; }
 [ -f "$VHOST" ] || { log "vhost $VHOST missing"; exit 0; }
+
+INTERNAL_PORT="$(grep -oE '"internalPort"[[:space:]]*:[[:space:]]*[0-9]+' "$INTENT" | grep -oE '[0-9]+$' | head -1 || true)"
+if ! [[ "${INTERNAL_PORT:-}" =~ ^[0-9]+$ ]] || [ "$INTERNAL_PORT" -lt 1 ] || [ "$INTERNAL_PORT" -gt 65535 ]; then
+  INTERNAL_PORT="${PANEL_INTERNAL_PORT:-3000}"
+fi
 
 port="$(grep -oE '"panelPort"[[:space:]]*:[[:space:]]*[0-9]+' "$INTENT" | grep -oE '[0-9]+$' | head -1 || true)"
 [ -n "${port:-}" ] || { log "no panelPort in $INTENT"; exit 0; }
@@ -1565,7 +1600,7 @@ if [ "$port" -eq "$INTERNAL_PORT" ]; then
   log "port $port collides with internal web port — ignoring"; exit 0
 fi
 case "$port" in
-  22|25|53|465|587|993|995|3000|3306|5432|5433|6379|8081|9443|52653)
+  22|25|53|465|587|993|995|3306|5432|5433|6379|8081|9443|52653)
     log "port $port is reserved — ignoring"; exit 0 ;;
 esac
 
@@ -1676,6 +1711,62 @@ Unit=wg-mate-panel-net.service
 WantedBy=multi-user.target
 WGMATE_WG_MATE_PANEL_NET_PATH_EOF
 
+    local xray_helpers=0 xray_restart=0
+    if systemctl cat xray.service >/dev/null 2>&1; then
+        xray_helpers=1
+        mkdir -p /etc/systemd/system/xray.service.d
+        cat > "/etc/systemd/system/xray.service.d/20-wg-mate-panel-config.conf.new" <<'WGMATE_XRAY_DROPIN_EOF'
+[Service]
+User=root
+Environment=XRAY_LOCATION_ASSET=/opt/wg-mate/data/xray
+ExecStart=
+ExecStart=/bin/sh -c 'B=/opt/wg-mate/data/xray/xray; [ -x "$$B" ] || B=/usr/local/bin/xray; exec "$$B" run -config /opt/wg-mate/data/xray/config.json'
+WGMATE_XRAY_DROPIN_EOF
+
+        if cmp -s "/etc/systemd/system/xray.service.d/20-wg-mate-panel-config.conf.new" "/etc/systemd/system/xray.service.d/20-wg-mate-panel-config.conf"; then
+            rm -f "/etc/systemd/system/xray.service.d/20-wg-mate-panel-config.conf.new"
+        else
+            mv -f "/etc/systemd/system/xray.service.d/20-wg-mate-panel-config.conf.new" "/etc/systemd/system/xray.service.d/20-wg-mate-panel-config.conf"
+            xray_restart=1
+        fi
+        cat > "/etc/systemd/system/xray-panel-reload.path" <<'WGMATE_XRAY_PANEL_RELOAD_PATH_EOF'
+[Unit]
+Description=Watch the panel Xray config and binary
+
+[Path]
+PathChanged=/opt/wg-mate/data/xray/config.json
+PathChanged=/opt/wg-mate/data/xray/xray
+Unit=xray-panel-reload.service
+
+[Install]
+WantedBy=multi-user.target
+WGMATE_XRAY_PANEL_RELOAD_PATH_EOF
+
+        cat > "/etc/systemd/system/xray-panel-reload.service" <<'WGMATE_XRAY_PANEL_RELOAD_SERVICE_EOF'
+[Unit]
+Description=Restart Xray after the panel rewrites its config or binary
+
+[Service]
+Type=oneshot
+Environment=XRAY_LOCATION_ASSET=/opt/wg-mate/data/xray
+ExecStart=/bin/sh -c 'B=/opt/wg-mate/data/xray/xray; [ -x "$$B" ] || B=/usr/local/bin/xray; "$$B" run -test -config /opt/wg-mate/data/xray/config.json >/dev/null 2>&1 && systemctl restart xray'
+WGMATE_XRAY_PANEL_RELOAD_SERVICE_EOF
+
+        cat > "/etc/systemd/system/xray-log-export.service" <<'WGMATE_XRAY_LOG_EXPORT_SERVICE_EOF'
+[Unit]
+Description=Copy the Xray journal into the panel data folder
+After=xray.service
+
+[Service]
+ExecStart=/bin/sh -c 'exec journalctl -u xray -f -n 0 -o short-iso >> /opt/wg-mate/data/xray/xray.log'
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+WGMATE_XRAY_LOG_EXPORT_SERVICE_EOF
+
+    fi
     if [ -e /etc/nginx/sites-enabled/default ] && ss -lntpH 'sport = :80' 2>/dev/null | grep -qv nginx; then
         rm -f /etc/nginx/sites-enabled/default
     fi
@@ -1683,6 +1774,11 @@ WGMATE_WG_MATE_PANEL_NET_PATH_EOF
     systemctl enable --now nginx >/dev/null 2>&1
     systemctl enable --now wg-mate-panel-ssl.path wg-mate-panel-net.path >/dev/null 2>&1
     systemctl start wg-mate-panel-ssl.service wg-mate-panel-net.service >/dev/null 2>&1
+    if [ "$xray_helpers" = 1 ]; then
+        systemctl enable xray-panel-reload.path xray-log-export.service >/dev/null 2>&1
+        systemctl restart xray-panel-reload.path xray-log-export.service >/dev/null 2>&1
+        [ "$xray_restart" = 1 ] && systemctl restart xray >/dev/null 2>&1
+    fi
     return 0
 }
 
