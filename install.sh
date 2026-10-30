@@ -1,6 +1,6 @@
 #!/bin/bash
 
-SCRIPT_VERSION="0.2.3"
+SCRIPT_VERSION="0.2.4"
 GIT_REPO="Mate-Panel/wg-mate-script"
 SCRIPT_URL="https://raw.githubusercontent.com/${GIT_REPO}/main/install.sh"
 SCRIPT_API_URL="https://api.github.com/repos/${GIT_REPO}/contents/install.sh?ref=main"
@@ -1712,6 +1712,30 @@ WantedBy=multi-user.target
 WGMATE_WG_MATE_PANEL_NET_PATH_EOF
 
     local xray_helpers=0 xray_restart=0
+    if ! systemctl cat xray.service >/dev/null 2>&1 && ! docker ps --format '{{.Names}}' 2>/dev/null | grep -q xray; then
+        cat > "/etc/systemd/system/xray.service" <<'WGMATE_XRAY_SERVICE_EOF'
+[Unit]
+Description=Xray Service
+After=network.target nss-lookup.target docker.service
+ConditionPathExists=|/opt/wg-mate/data/xray/xray
+ConditionPathExists=|/usr/local/bin/xray
+
+[Service]
+User=root
+Environment=XRAY_LOCATION_ASSET=/opt/wg-mate/data/xray
+ExecStart=/bin/sh -c 'B=/opt/wg-mate/data/xray/xray; [ -x "$$B" ] || B=/usr/local/bin/xray; exec "$$B" run -config /opt/wg-mate/data/xray/config.json'
+Restart=on-failure
+RestartSec=3
+LimitNPROC=10000
+LimitNOFILE=1000000
+
+[Install]
+WantedBy=multi-user.target
+WGMATE_XRAY_SERVICE_EOF
+
+        systemctl daemon-reload >/dev/null 2>&1
+        systemctl enable xray >/dev/null 2>&1
+    fi
     if systemctl cat xray.service >/dev/null 2>&1; then
         xray_helpers=1
         mkdir -p /etc/systemd/system/xray.service.d
