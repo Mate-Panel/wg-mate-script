@@ -36,7 +36,7 @@ wg-mate
 ```
 
 ```
-  wg-mate  v0.3.0
+  wg-mate  v0.3.1
   ──────────────────────────────────────────
   Panel     ● running  v0.2.4  ↑ v0.2.5
   URL       http://203.0.113.10:3000
@@ -53,7 +53,7 @@ wg-mate
   ❯
 ```
 
-The menu only lists what makes sense right now: before the panel is installed it offers just `Install`, and when the panel is stopped `Start` replaces `Restart` and `Stop`. The result of each action prints right under the menu, with no screen clearing and no "press Enter" pauses.
+The menu only lists what makes sense right now: before the panel is installed it offers just `Install`, and when the panel is stopped `Start` replaces `Restart` and `Stop`. After an action finishes, its result stays on screen; press Enter and the screen clears and the menu comes back. After an update you see the new version, channel, service status and panel URL.
 
 Every action is also available directly:
 
@@ -107,7 +107,7 @@ sudo bash install.sh version      # print the installer version
 
 `upgrade` works as an alias of `update`, and `purge` / `remove` as aliases of `uninstall`.
 
-The install always uses the stable channel. To install beta or an exact version, pass `--channel beta` or `--version v0.2.4`. In the menu, `Update panel` asks for the channel, with the current one as the default.
+The install always uses the stable channel. To install beta or an exact version, pass `--channel beta` or `--version v0.2.4`. Updates default to stable too, even if the panel was on beta or a pinned version: in the menu `Update panel` asks for the channel with `stable` as the default, and `wg-mate update` without flags always moves to stable.
 
 Every command also takes flags, so a whole install can run unattended:
 

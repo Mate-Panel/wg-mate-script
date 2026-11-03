@@ -1,6 +1,6 @@
 #!/bin/bash
 
-SCRIPT_VERSION="0.3.0"
+SCRIPT_VERSION="0.3.1"
 GIT_REPO="Mate-Panel/wg-mate-script"
 SCRIPT_URL="https://raw.githubusercontent.com/${GIT_REPO}/main/install.sh"
 SCRIPT_API_URL="https://api.github.com/repos/${GIT_REPO}/contents/install.sh?ref=main"
@@ -2116,7 +2116,7 @@ cmd_install() {
 }
 
 cmd_update() {
-    local current pv latest want
+    local current pv latest want start took new_pv state_txt
     require_installed || return 1
     current="$IMAGE_TAG"
     pv="$(panel_version)"
@@ -2133,7 +2133,7 @@ cmd_update() {
         echo ""
         info "Channel: stable, beta, or an exact version like v0.2.4"
         while true; do
-            want="$(ask "Channel" "$(channel_name "$current")")"
+            want="$(ask "Channel" "stable")"
             IMAGE_TAG="$(normalize_channel "$want")" && break
             warn "Unknown channel: ${want}" >&2
         done
@@ -2141,9 +2141,12 @@ cmd_update() {
             info "Cancelled - nothing was changed."
             return 0
         fi
+    else
+        IMAGE_TAG="latest"
     fi
     : > "$LOG_FILE"
     echo ""
+    start=$SECONDS
     env_set WG_MATE_CHANNEL "$IMAGE_TAG"
     migrate_env
     step "Write config" refresh_config || { show_log_tail; return 1; }
@@ -2156,8 +2159,24 @@ cmd_update() {
     fi
     step "Restart services" compose up -d || { show_log_tail; return 1; }
     step "Wait for API" wait_api_healthy 60 || warn "The API is not answering yet - check: wg-mate logs api"
-    echo ""
-    ok "Panel is on $(panel_version) ($(channel_name "$IMAGE_TAG"))."
+
+    fmt_secs $((SECONDS - start)) took
+    new_pv="$(panel_version)"
+    read_panel_state
+    case "$PANEL_STATE" in
+        running) state_txt="$(dot "$C_OK" "${C_OK}running${C_RESET}") ${C_DIM}${PANEL_UP}/${PANEL_TOTAL} up${C_RESET}" ;;
+        degraded) state_txt="$(dot "$C_WARN" "${C_WARN}degraded${C_RESET}") ${C_DIM}${PANEL_UP}/${PANEL_TOTAL} up${C_RESET}" ;;
+        *) state_txt="$(dot "$C_BAD" "${C_BAD}not running${C_RESET}")" ;;
+    esac
+    printf '\n  %sUpdated%s %sin %s%s\n\n' "$C_OK" "$C_RESET" "$C_DIM" "$took" "$C_RESET"
+    if [ -n "$pv" ] && [ "$pv" != "$new_pv" ]; then
+        kv "Version" "${C_BOLD}${new_pv:-unknown}${C_RESET} ${C_DIM}(was ${pv})${C_RESET}"
+    else
+        kv "Version" "${C_BOLD}${new_pv:-unknown}${C_RESET}"
+    fi
+    kv "Channel" "$(channel_name "$IMAGE_TAG")"
+    kv "Status" "$state_txt"
+    kv "URL" "${C_ACCENT}$(panel_url)${C_RESET}"
 }
 
 cmd_start() {
@@ -2575,6 +2594,7 @@ show_menu() {
         ( latest_panel_version >/dev/null 2>&1 & )
     fi
     while true; do
+        clear 2>/dev/null
         print_header
         labels=()
         actions=()
@@ -2601,8 +2621,11 @@ show_menu() {
         if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "${#actions[@]}" ]; then
             echo ""
             "${actions[$((choice - 1))]}"
+            printf '\n  %sPress Enter to return to the menu…%s ' "$C_DIM" "$C_RESET"
+            read -r _ || exit 0
         else
             warn "Choose one of the numbers above."
+            sleep 1
         fi
     done
 }
