@@ -25,7 +25,7 @@ To run an action straight from the one-liner, separate it with `--`:
 sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/Mate-Panel/wg-mate-script/main/install.sh)" -- install
 ```
 
-The installer asks for the image tag, the panel web port and the admin account, then prints the panel URL and credentials when it is done. Open the panel, log in, and activate your license.
+The installer asks three questions (panel web port, admin username, admin password; press Enter on the password for a random one), shows a summary, and installs after you confirm. Every Docker image download shows its size, speed and time left. When it is done it prints the panel URL and credentials. Open the panel, log in, and activate your license.
 
 ## The `wg-mate` command
 
@@ -36,62 +36,24 @@ wg-mate
 ```
 
 ```
-  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  ▌ WG-MATE  — WireGuard / OpenVPN / Xray Panel
-  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  wg-mate  v0.3.0
+  ──────────────────────────────────────────
+  Panel     ● running  v0.2.4  ↑ v0.2.5
+  URL       http://203.0.113.10:3000
 
-  ▌ Version
-  ────────────────────────────────────────────────────
-    Installer  : ● 4.1.0 (up to date)
-    Panel      : ● v0.2.4
-    Channel    : stable
+  1) Update panel
+  2) Restart
+  3) Stop
+  4) Logs
+  5) Login info
+  6) Backup / Restore
+  7) Uninstall
+  0) Exit
 
-  ▌ Panel Status
-  ────────────────────────────────────────────────────
-    State      : ● running
-    Containers : 3/3 up
-    URL        : http://203.0.113.10:3000
-    API        : ● healthy (127.0.0.1:52653)
-    Directory  : /opt/wg-mate
-
-  ▌ Services
-  ────────────────────────────────────────────────────
-    web        : ● Up 2 hours
-    api        : ● Up 2 hours
-    db         : ● Up 2 hours (healthy)
-    Port 3000  : ● ours (web)
-
-  ▌ System
-  ────────────────────────────────────────────────────
-    OS         : Ubuntu 24.04 LTS
-    Docker     : ● 27.3.1
-    WireGuard  : ● kernel module ready
-    Server IP  : 203.0.113.10
-
-  ▌ Resources
-  ────────────────────────────────────────────────────
-    RAM        : 812MB / 3936MB  (20%)
-    Disk       : 6.1G / 78G  (8%)
-    Uptime     : 3 days, 4 hours
-
-  ▌ Menu
-  ────────────────────────────────────────────────────
-    [1]  Install panel
-    [2]  Update panel
-    [3]  Change update channel
-    [4]  Panel status
-    [5]  Show logs
-    [6]  Start services
-    [7]  Stop services
-    [8]  Restart services
-    [9]  Remove panel
-    [10] Purge everything
-    [11] Help & Parameters
-    [0]  Exit
-  ────────────────────────────────────────────────────
-
-  ❯ Select an option [0-11]:
+  ❯
 ```
+
+The menu only lists what makes sense right now: before the panel is installed it offers just `Install`, and when the panel is stopped `Start` replaces `Restart` and `Stop`. The result of each action prints right under the menu, with no screen clearing and no "press Enter" pauses.
 
 Every action is also available directly:
 
@@ -128,22 +90,24 @@ Self-update is skipped automatically when the script is run from a git clone, so
 
 ```bash
 sudo bash install.sh install      # first-time setup
-sudo bash install.sh update       # pull a newer tag and recreate the stack
-sudo bash install.sh channel      # switch the update channel
-sudo bash install.sh status       # container state + api health
-sudo bash install.sh logs         # follow logs
-sudo bash install.sh restart
+sudo bash install.sh update       # pull newer images and recreate the stack
 sudo bash install.sh start
 sudo bash install.sh stop         # stop containers, keep data
-sudo bash install.sh doctor       # diagnose a broken install
+sudo bash install.sh restart
+sudo bash install.sh logs         # follow logs
+sudo bash install.sh login        # panel URL and admin accounts
+sudo bash install.sh status       # services, ports and server details
 sudo bash install.sh backup       # database + config archive
 sudo bash install.sh restore      # restore from a backup archive
-sudo bash install.sh remove       # remove containers, keep data
-sudo bash install.sh purge        # remove everything, permanently
+sudo bash install.sh doctor       # diagnose a broken install
+sudo bash install.sh selfupdate   # download the newest script
+sudo bash install.sh uninstall    # remove everything, permanently
 sudo bash install.sh version      # print the installer version
 ```
 
-`upgrade` and `uninstall` still work as aliases of `update` and `remove`.
+`upgrade` works as an alias of `update`, and `purge` / `remove` as aliases of `uninstall`.
+
+The install always uses the stable channel. To install beta or an exact version, pass `--channel beta` or `--version v0.2.4`. In the menu, `Update panel` asks for the channel, with the current one as the default.
 
 Every command also takes flags, so a whole install can run unattended:
 
@@ -159,7 +123,9 @@ An interrupted install is resumable: every finished phase (Docker, configuration
 
 `update` pulls the newest images and recreates the containers — the database, WireGuard keys, certificates and panel settings are untouched.
 
-`purge` is destructive: it deletes the containers, the Docker volumes (including the database), `/opt/wg-mate`, the host helper systemd units and the nginx vhosts created by the panel. It asks you to type `DELETE` to confirm.
+`uninstall` is destructive: it deletes the containers, the Docker volumes (including the database), `/opt/wg-mate`, the host helper systemd units and the nginx vhosts created by the panel. It asks for confirmation first, and the default answer is no.
+
+The log of the last install, update or backup is kept at `/run/wg-mate/wg-mate.log`; when a step fails, its last lines are printed right away.
 
 ---
 
@@ -230,7 +196,7 @@ sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/Mate-Panel/wg-mate-
 be changed from inside the panel. If you are locked out entirely, the admin account has to be seeded
 again, which means reinstalling.
 
-**`wg-mate: command not found`** — the shortcut is created by `install` and `update`. A panel installed with an older installer has neither the shortcut nor self-update, so run the one-liner once and pick `2) Update panel`:
+**`wg-mate: command not found`** — the shortcut is created by `install` and `update`. A panel installed with an older installer has neither the shortcut nor self-update, so run the one-liner once and pick `Update panel`:
 
 ```bash
 sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/Mate-Panel/wg-mate-script/main/install.sh)"
@@ -248,7 +214,7 @@ From then on `wg-mate` works and the script keeps itself up to date.
 sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/Mate-Panel/wg-mate-script/main/install.sh)"
 ```
 
-اسکریپت داکر را در صورت نبودن خودش نصب می‌کند، سپس پورت پنل و نام کاربری و رمز مدیر را می‌پرسد و در پایان آدرس پنل و اطلاعات ورود را نشان می‌دهد. بعد از ورود به پنل، لایسنس را فعال کنید.
+اسکریپت فقط سه سؤال می‌پرسد: پورت پنل، نام کاربری و رمز مدیر (اگر برای رمز Enter بزنید، یک رمز تصادفی ساخته می‌شود). بعد داکر را در صورت نبودن خودش نصب می‌کند و دانلود هر ایمیج را با حجم، سرعت و زمان باقی‌مانده نشان می‌دهد. در پایان آدرس پنل و اطلاعات ورود نمایش داده می‌شود. بعد از ورود به پنل، لایسنس را فعال کنید.
 
 بعد از نصب، هر جای سرور کافی است `wg-mate` را تایپ کنید تا منوی مدیریت باز شود:
 
@@ -262,11 +228,11 @@ wg-mate
 
 نکته‌ها:
 
-- اگر پنل را با نسخه‌ی قدیمی اسکریپت نصب کرده‌اید، یک‌بار همان دستور نصب یک‌خطی را اجرا کنید و گزینه‌ی `2) Update panel` را بزنید تا میانبر `wg-mate` و آپدیت خودکار فعال شود.
+- اگر پنل را با نسخه‌ی قدیمی اسکریپت نصب کرده‌اید، یک‌بار همان دستور نصب یک‌خطی را اجرا کنید و گزینه‌ی `Update panel` را بزنید تا میانبر `wg-mate` و آپدیت خودکار فعال شود.
 - اسکریپت هر بار که اجرا می‌شود خودش را از همین ریپو آپدیت می‌کند؛ اگر اینترنت نبود یا فایل خراب بود، بی‌سروصدا با همان نسخه‌ی فعلی ادامه می‌دهد.
 - آپدیت فقط تگ ایمیج را عوض می‌کند؛ دیتابیس، کلیدهای WireGuard و تنظیمات پنل دست‌نخورده می‌مانند.
 - نام کاربری و رمز مدیر در هیچ فایلی ذخیره نمی‌شود؛ فقط یک‌بار موقع نصب برای ساخت حساب استفاده می‌شود. رمز به‌صورت bcrypt ذخیره می‌شود و فقط از داخل خود پنل قابل تغییر است — اسکریپت دستور تغییر رمز ندارد.
-- گزینه‌ی `purge` همه‌چیز را برای همیشه پاک می‌کند — دیتابیس، کانفیگ‌ها و پوشه‌ی `/opt/wg-mate`.
+- گزینه‌ی `Uninstall` (دستور `wg-mate uninstall`) همه‌چیز را برای همیشه پاک می‌کند — دیتابیس، کانفیگ‌ها و پوشه‌ی `/opt/wg-mate`.
 - قبل از هر تغییر مهم از دیتابیس بکاپ بگیرید (دستور `pg_dump` در بخش بالا).
 
 ---
