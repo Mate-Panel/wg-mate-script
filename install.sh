@@ -1204,6 +1204,7 @@ PULL_ERROR=""
 PULL_BYTES=0
 PULL_UPTODATE=0
 PULL_LINES=0
+PULL_UPDATED=0
 
 image_label() {
     case "$1" in
@@ -1370,11 +1371,34 @@ pull_warn() {
     printf '%s       %s!%s %s%s: %s%s%s\n' "$CLR" "$C_WARN" "$C_RESET" "$C_WARN" "$1" "${reason:0:70}" "$C_RESET" "$3"
 }
 
+remote_digest() {
+    [ -S "$DOCKER_SOCK" ] || return 0
+    curl -s --max-time 20 --unix-socket "$DOCKER_SOCK" "http://localhost/distribution/$1/json" 2>/dev/null \
+        | grep -oE '"digest":"sha256:[0-9a-f]+"' | head -1 | cut -d'"' -f4
+}
+
+image_has_digest() {
+    docker image inspect --format '{{range .RepoDigests}}{{println .}}{{end}}' "$1" 2>/dev/null | grep -q "@$2\$"
+}
+
 pull_image() {
-    local ref="$1" label start=$SECONDS attempt rc=1 mref warns=0 took size via="" line
+    local ref="$1" label start=$SECONDS attempt rc=1 mref warns=0 took size via="" line digest
     label="$(image_label "$ref")"
     if [ "$IS_TTY" = "1" ]; then
         printf '    %s⠿%s %s%-3s%s  %s\n' "$C_ACCENT" "$C_RESET" "$C_BOLD" "$label" "$C_RESET" "$ref"
+        printf '%s       %schecking for a new version…%s' "$CLR" "$C_DIM" "$C_RESET"
+    fi
+    digest="$(remote_digest "$ref")"
+    if [ -n "$digest" ] && image_has_digest "$ref" "$digest"; then
+        echo "$ref is already at $digest - skipped" >> "$LOG_FILE"
+        line="${C_OK}✔${C_RESET} ${C_BOLD}$(printf '%-3s' "$label")${C_RESET}  ${ref}  ${C_DIM}already the latest${C_RESET}"
+        if [ "$IS_TTY" = "1" ]; then
+            printf '%s\033[1A\r\033[K    %s\n' "$CLR" "$line"
+        else
+            printf '    %s\n' "$line"
+        fi
+        PULL_LINES=1
+        return 0
     fi
     for attempt in 1 2 3; do
         pull_one "$ref"
@@ -1400,6 +1424,7 @@ pull_image() {
     fi
     fmt_secs $((SECONDS - start)) took
     if [ "$rc" -eq 0 ]; then
+        [ "$PULL_UPTODATE" = "1" ] || PULL_UPDATED=$((PULL_UPDATED + 1))
         if [ "$PULL_BYTES" -eq 0 ]; then size="up to date"; else fmt_mb "$PULL_BYTES" size; fi
         line="${C_OK}✔${C_RESET} ${C_BOLD}$(printf '%-3s' "$label")${C_RESET}  ${ref}  ${C_DIM}${size} · ${took}${via}${C_RESET}"
     elif image_present "$ref"; then
@@ -1420,10 +1445,11 @@ pull_image() {
 
 pull_images() {
     local refs=("${API_IMAGE}:${IMAGE_TAG}" "${WEB_IMAGE}:${IMAGE_TAG}" "$DB_IMAGE")
-    local ref start=$SECONDS good=0 lines=0 took mark
+    local ref start=$SECONDS good=0 lines=0 took mark result
+    PULL_UPDATED=0
     TERM_COLS="$(tput cols 2>/dev/null || echo 80)"
-    printf '\n### %s  Pull images\n' "$(date '+%F %T')" >> "$LOG_FILE"
-    printf '  %s⠿%s %-16s %s%s%s\n' "$C_ACCENT" "$C_RESET" "Pull images" "$C_DIM" "$(channel_name "$IMAGE_TAG")" "$C_RESET"
+    printf '\n### %s  Images\n' "$(date '+%F %T')" >> "$LOG_FILE"
+    printf '  %s⠿%s %-16s %s%s%s\n' "$C_ACCENT" "$C_RESET" "Images" "$C_DIM" "$(channel_name "$IMAGE_TAG")" "$C_RESET"
     for ref in "${refs[@]}"; do
         pull_image "$ref" && good=$((good + 1))
         lines=$((lines + PULL_LINES))
@@ -1431,11 +1457,18 @@ pull_images() {
     fmt_secs $((SECONDS - start)) took
     mark="${C_OK}✔${C_RESET}"
     [ "$good" -eq "${#refs[@]}" ] || mark="${C_BAD}✘${C_RESET}"
+    if [ "$good" -ne "${#refs[@]}" ]; then
+        result="${good}/${#refs[@]} ready"
+    elif [ "$PULL_UPDATED" -eq 0 ]; then
+        result="no new versions"
+    else
+        result="${PULL_UPDATED} updated"
+    fi
     if [ "$IS_TTY" = "1" ]; then
-        printf '\033[%dA\r\033[K  %s %-16s %s%d/%d · %s%s\n' $((lines + 1)) "$mark" "Pull images" "$C_DIM" "$good" "${#refs[@]}" "$took" "$C_RESET"
+        printf '\033[%dA\r\033[K  %s %-16s %s%s · %s%s\n' $((lines + 1)) "$mark" "Images" "$C_DIM" "$result" "$took" "$C_RESET"
         printf '\033[%dB' "$lines"
     else
-        printf '  %s %-16s %d/%d · %s\n' "$mark" "Pull images" "$good" "${#refs[@]}" "$took"
+        printf '  %s %-16s %s · %s\n' "$mark" "Images" "$result" "$took"
     fi
     [ "$good" -eq "${#refs[@]}" ]
 }
@@ -1652,6 +1685,22 @@ write_config() {
     write_compose || return 1
     write_bootstrap_admin || return 1
     install_command
+}
+
+helpers_hash() { declare -f install_host_helpers | md5sum | cut -d' ' -f1; }
+
+helpers_current() {
+    have nginx && [ -f /etc/systemd/system/wg-mate-panel-ssl.path ] \
+        && [ "$(cat "$APP_DIR/.host_helpers" 2>/dev/null)" = "$(helpers_hash)" ]
+}
+
+setup_host_helpers() {
+    install_host_helpers || return 1
+    helpers_hash > "$APP_DIR/.host_helpers"
+}
+
+skipped() {
+    printf '  %s✔%s %-16s %s%s%s\n' "$C_OK" "$C_RESET" "$1" "$C_DIM" "$2" "$C_RESET"
 }
 
 refresh_config() {
@@ -2089,7 +2138,7 @@ cmd_install() {
     fi
     if ! phase_done CONFIG; then
         step "Write config" write_config || { install_failed; return 1; }
-        step "Host helpers" install_host_helpers \
+        step "Host helpers" setup_host_helpers \
             || warn "The nginx helpers failed - the SSL page will not be able to issue certificates."
         mark_phase CONFIG
     fi
@@ -2116,7 +2165,7 @@ cmd_install() {
 }
 
 cmd_update() {
-    local current pv latest want start took new_pv state_txt
+    local current pv latest want start took new_pv state_txt config_before config_changed=0 done_title
     require_installed || return 1
     current="$IMAGE_TAG"
     pv="$(panel_version)"
@@ -2147,18 +2196,33 @@ cmd_update() {
     : > "$LOG_FILE"
     echo ""
     start=$SECONDS
+    config_before="$(cat "$COMPOSE_FILE" "$ENV_FILE" 2>/dev/null | md5sum)"
     env_set WG_MATE_CHANNEL "$IMAGE_TAG"
     migrate_env
-    step "Write config" refresh_config || { show_log_tail; return 1; }
-    step "Host helpers" install_host_helpers \
-        || warn "The nginx helpers failed - the SSL page will not be able to issue certificates."
+    step "Config" refresh_config || { show_log_tail; return 1; }
+    if [ "$(cat "$COMPOSE_FILE" "$ENV_FILE" 2>/dev/null | md5sum)" != "$config_before" ]; then
+        config_changed=1
+    fi
+    if helpers_current; then
+        skipped "Host helpers" "already up to date"
+    else
+        step "Host helpers" setup_host_helpers \
+            || warn "The nginx helpers failed - the SSL page will not be able to issue certificates."
+    fi
     if ! pull_images; then
         show_log_tail
         fail "Check that $(channel_name "$IMAGE_TAG") exists and that this server can reach ghcr.io and Docker Hub."
         return 1
     fi
-    step "Restart services" compose up -d || { show_log_tail; return 1; }
-    step "Wait for API" wait_api_healthy 60 || warn "The API is not answering yet - check: wg-mate logs api"
+    read_panel_state
+    if [ "$config_changed" = "1" ] || [ "$PULL_UPDATED" -gt 0 ] || [ "$PANEL_STATE" != "running" ]; then
+        step "Apply changes" compose up -d || { show_log_tail; return 1; }
+        step "Wait for API" wait_api_healthy 60 || warn "The API is not answering yet - check: wg-mate logs api"
+        done_title="Updated"
+    else
+        skipped "Services" "nothing changed - kept running"
+        done_title="Already up to date"
+    fi
 
     fmt_secs $((SECONDS - start)) took
     new_pv="$(panel_version)"
@@ -2168,7 +2232,7 @@ cmd_update() {
         degraded) state_txt="$(dot "$C_WARN" "${C_WARN}degraded${C_RESET}") ${C_DIM}${PANEL_UP}/${PANEL_TOTAL} up${C_RESET}" ;;
         *) state_txt="$(dot "$C_BAD" "${C_BAD}not running${C_RESET}")" ;;
     esac
-    printf '\n  %sUpdated%s %sin %s%s\n\n' "$C_OK" "$C_RESET" "$C_DIM" "$took" "$C_RESET"
+    printf '\n  %s%s%s %sin %s%s\n\n' "$C_OK" "$done_title" "$C_RESET" "$C_DIM" "$took" "$C_RESET"
     if [ -n "$pv" ] && [ "$pv" != "$new_pv" ]; then
         kv "Version" "${C_BOLD}${new_pv:-unknown}${C_RESET} ${C_DIM}(was ${pv})${C_RESET}"
     else

@@ -121,7 +121,7 @@ sudo bash install.sh --help
 
 An interrupted install is resumable: every finished phase (Docker, configuration, images, start) is recorded, and the next `install` run offers to continue from the last completed step without asking again for the answers you already gave.
 
-`update` pulls the newest images and recreates the containers — the database, WireGuard keys, certificates and panel settings are untouched.
+`update` first asks the registry whether each image (api, web, postgres) has a new version and downloads only the ones that changed. The nginx helpers are reinstalled only when the script ships a new version of them, and the containers are recreated only when an image or the config actually changed; otherwise the panel keeps running untouched. The database, WireGuard keys, certificates and panel settings are never touched.
 
 `uninstall` is destructive: it deletes the containers, the Docker volumes (including the database), `/opt/wg-mate`, the host helper systemd units and the nginx vhosts created by the panel. It asks for confirmation first, and the default answer is no.
 
