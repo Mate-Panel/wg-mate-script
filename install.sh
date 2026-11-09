@@ -631,6 +631,7 @@ setup_docker() {
 install_host_helpers() {
     local sslsh="$APP_DIR/scripts/panel-ssl-apply.sh"
     local netsh="$APP_DIR/scripts/panel-net-apply.sh"
+    local updsh="$APP_DIR/scripts/panel-update-apply.sh"
     if ! have nginx; then
         have apt-get || return 1
         DEBIAN_FRONTEND=noninteractive apt-get install -y -o DPkg::Lock::Timeout=180 nginx >/dev/null 2>&1 || return 1
@@ -776,7 +777,7 @@ https_ports_used=""
 
 # Emit one vhost per hostname. Panel+sub may share a domain (and port); ports
 # are unioned into a single TLS server block.
-while IFS='|' read -r d ports || [ -n "${d:-}" ]; do
+while IFS='|' read -r d ports subonly || [ -n "${d:-}" ]; do
   [ -n "${d:-}" ] || continue
   [[ "$d" =~ ^[A-Za-z0-9.-]+$ ]] || { log "skip invalid domain '$d'"; continue; }
 
@@ -806,6 +807,39 @@ while IFS='|' read -r d ports || [ -n "${d:-}" ]; do
 
   acme_block="$(acme_server_block "$d" "    location / { return 301 https://${redir_host}\$request_uri; }")"
 
+  proxy_block="        proxy_pass         http://127.0.0.1:${INTERNAL_PORT};
+        proxy_http_version 1.1;
+        proxy_set_header   Upgrade \$http_upgrade;
+        proxy_set_header   Connection 'upgrade';
+        proxy_set_header   Host \$host;
+        proxy_set_header   X-Real-IP \$remote_addr;
+        proxy_set_header   X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header   X-Forwarded-Proto \$scheme;
+        proxy_set_header   X-Forwarded-Host \$http_host;
+        proxy_cache_bypass \$http_upgrade;
+        proxy_request_buffering off;"
+
+  if [ "$subonly" = "1" ]; then
+    locations="    location /api/sub/ {
+${proxy_block}
+    }
+    location /api/ { return 404; }
+    location /sub/ {
+${proxy_block}
+    }
+    location /assets/ {
+${proxy_block}
+    }
+    location ~ ^/[^/]+\.(js|css|svg|png|webp|ico|woff2?|webmanifest|json|txt)\$ {
+${proxy_block}
+    }
+    location / { return 404; }"
+  else
+    locations="    location / {
+${proxy_block}
+    }"
+  fi
+
   cat >"$NGINX_AVAIL/${PREFIX}${d}" <<EOF
 ${acme_block}
 server {
@@ -816,19 +850,7 @@ ${listen_tls}    server_name ${d};
     proxy_read_timeout 300s;
     proxy_send_timeout 300s;
 
-    location / {
-        proxy_pass         http://127.0.0.1:${INTERNAL_PORT};
-        proxy_http_version 1.1;
-        proxy_set_header   Upgrade \$http_upgrade;
-        proxy_set_header   Connection 'upgrade';
-        proxy_set_header   Host \$host;
-        proxy_set_header   X-Real-IP \$remote_addr;
-        proxy_set_header   X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_set_header   X-Forwarded-Proto \$scheme;
-        proxy_set_header   X-Forwarded-Host \$http_host;
-        proxy_cache_bypass \$http_upgrade;
-        proxy_request_buffering off;
-    }
+${locations}
 }
 EOF
   ln -sf "$NGINX_AVAIL/${PREFIX}${d}" "$NGINX_ENABLED/${PREFIX}${d}"
@@ -840,6 +862,7 @@ try:
 except Exception:
     sys.exit(0)
 by_domain = {}
+sub_only = {}
 for c in data.get("certs") or []:
     d = (c.get("domain") or "").strip()
     if not d:
@@ -852,8 +875,9 @@ for c in data.get("certs") or []:
     ports = by_domain.setdefault(d, [])
     if p not in ports:
         ports.append(p)
+    sub_only[d] = sub_only.get(d, True) and bool(c.get("subOnly"))
 for d, ports in by_domain.items():
-    print(d + "|" + " ".join(str(p) for p in ports))
+    print(d + "|" + " ".join(str(p) for p in ports) + "|" + ("1" if sub_only.get(d) else "0"))
 PY
 )
 
@@ -1039,7 +1063,27 @@ else
 fi
 WGMATE_PANEL_NET_APPLY_SH_EOF
 
-    chmod 755 "$sslsh" "$netsh"
+    cat > "$updsh" <<'WGMATE_PANEL_UPDATE_APPLY_SH_EOF'
+#!/usr/bin/env bash
+DATA=/opt/wg-mate/data/panel
+REQ="$DATA/update-request"
+[ -s "$REQ" ] || exit 0
+CH="$(head -c 32 "$REQ" | tr -cd 'a-z')"
+rm -f "$REQ"
+case "$CH" in stable|beta) ;; *) CH=stable ;; esac
+PORT="$(grep -E '^API_PORT=' /opt/wg-mate/.env 2>/dev/null | cut -d= -f2)"
+ver() { curl -fsS --max-time 3 "http://127.0.0.1:${PORT:-52653}/health" 2>/dev/null | grep -oE '"version" *: *"[^"]*"' | cut -d'"' -f4; }
+FROM="$(ver)"
+START="$(date +%s)"
+printf 'running %s %s\n' "$CH" "$START" > "$DATA/update-status"
+if wg-mate update --channel "$CH" -y > "$DATA/update.log" 2>&1; then R=done; else R=failed; fi
+TO="$(ver)"
+END="$(date +%s)"
+printf '%s %s %s\n' "$R" "$CH" "$END" > "$DATA/update-status"
+printf '%s %s %s %s %s %s\n' "$R" "$CH" "${FROM:--}" "${TO:--}" "$START" "$END" >> "$DATA/update-history"
+WGMATE_PANEL_UPDATE_APPLY_SH_EOF
+
+    chmod 755 "$sslsh" "$netsh" "$updsh"
     cat > "/etc/systemd/system/wg-mate-panel-ssl.service" <<'WGMATE_WG_MATE_PANEL_SSL_SERVICE_EOF'
 [Unit]
 Description=Apply wg-mate SSL certificates to nginx
@@ -1089,6 +1133,28 @@ Unit=wg-mate-panel-net.service
 [Install]
 WantedBy=multi-user.target
 WGMATE_WG_MATE_PANEL_NET_PATH_EOF
+
+    cat > "/etc/systemd/system/wg-mate-panel-update.service" <<'WGMATE_WG_MATE_PANEL_UPDATE_SERVICE_EOF'
+[Unit]
+Description=Run a wg-mate panel update requested from the panel
+
+[Service]
+Type=oneshot
+TimeoutStartSec=1800
+ExecStart=/opt/wg-mate/scripts/panel-update-apply.sh
+WGMATE_WG_MATE_PANEL_UPDATE_SERVICE_EOF
+
+    cat > "/etc/systemd/system/wg-mate-panel-update.path" <<'WGMATE_WG_MATE_PANEL_UPDATE_PATH_EOF'
+[Unit]
+Description=Watch for wg-mate panel update requests
+
+[Path]
+PathExists=/opt/wg-mate/data/panel/update-request
+Unit=wg-mate-panel-update.service
+
+[Install]
+WantedBy=multi-user.target
+WGMATE_WG_MATE_PANEL_UPDATE_PATH_EOF
 
     local xray_helpers=0 xray_restart=0
     if ! systemctl cat xray.service >/dev/null 2>&1 && ! docker ps --format '{{.Names}}' 2>/dev/null | grep -q xray; then
@@ -1175,7 +1241,7 @@ WGMATE_XRAY_LOG_EXPORT_SERVICE_EOF
     fi
     systemctl daemon-reload >/dev/null 2>&1
     systemctl enable --now nginx >/dev/null 2>&1
-    systemctl enable --now wg-mate-panel-ssl.path wg-mate-panel-net.path >/dev/null 2>&1
+    systemctl enable --now wg-mate-panel-ssl.path wg-mate-panel-net.path wg-mate-panel-update.path >/dev/null 2>&1
     systemctl start wg-mate-panel-ssl.service wg-mate-panel-net.service >/dev/null 2>&1
     if [ "$xray_helpers" = 1 ]; then
         systemctl enable xray-panel-reload.path xray-log-export.service >/dev/null 2>&1
