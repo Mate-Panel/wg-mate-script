@@ -1,6 +1,6 @@
 #!/bin/bash
 
-SCRIPT_VERSION="0.3.1"
+SCRIPT_VERSION="0.3.2"
 GIT_REPO="Mate-Panel/wg-mate-script"
 SCRIPT_URL="https://raw.githubusercontent.com/${GIT_REPO}/main/install.sh"
 SCRIPT_API_URL="https://api.github.com/repos/${GIT_REPO}/contents/install.sh?ref=main"
@@ -1580,6 +1580,7 @@ services:
       WG_AGENT_ADDR: \${WG_AGENT_ADDR:-:9443}
       WG_AGENT_PUBLIC: \${WG_AGENT_PUBLIC:-}
       WG_AGENT_BINARY: /app/wg-mate-agent
+      WG_MATE_CHANNEL: \${WG_MATE_CHANNEL:-latest}
       WG_HOST_ROOT: /host
       LICENSE_REQUIRE_SIG: \${LICENSE_REQUIRE_SIG:-1}
       LICENSE_VERIFY_PUBKEY: \${LICENSE_VERIFY_PUBKEY:-${LICENSE_PUBKEY}}
