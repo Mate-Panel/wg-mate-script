@@ -1555,7 +1555,7 @@ services:
     command:
       - /bin/sh
       - -c
-      - until [ -s /data/agent-local/node-id ]; do sleep 2; done; I=\$\$(cat /data/agent-local/node-id); D=/data/agent-local/\$\$I; exec env WG_AGENT_SERVER_ID=\$\$I WG_AGENT_CA=\$\$D/ca.crt WG_AGENT_CERT=\$\$D/node.crt WG_AGENT_KEY=\$\$D/node.key /app/wg-mate-agent
+      - until [ -s /data/agent-local/node-id ]; do sleep 2; done; I=\$\$(cat /data/agent-local/node-id); D=/data/agent-local/\$\$I; B=\$\$D/wg-mate-agent; [ -x \$\$B ] || B=/app/wg-mate-agent; exec env WG_AGENT_SERVER_ID=\$\$I WG_AGENT_CA=\$\$D/ca.crt WG_AGENT_CERT=\$\$D/node.crt WG_AGENT_KEY=\$\$D/node.key \$\$B
 
   xray:
     image: ${API_IMAGE}:${IMAGE_TAG}
