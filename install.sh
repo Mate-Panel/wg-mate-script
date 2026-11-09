@@ -1495,12 +1495,9 @@ services:
 
   api:
     image: ${API_IMAGE}:${IMAGE_TAG}
+    init: true
     restart: unless-stopped
     network_mode: host
-    privileged: true
-    cap_add:
-      - NET_ADMIN
-      - SYS_MODULE
     environment:
       TZ: \${TZ:-${DEFAULT_TZ}}
       WG_API_ADDR: ":\${API_PORT:-${DEFAULT_API_PORT}}"
@@ -1527,13 +1524,81 @@ services:
       - ./data/xray:/data/xray
       - ./data/openvpn:/etc/openvpn
       - /etc/wireguard:/etc/wireguard
+      - /etc/amnezia:/etc/amnezia
       - ./data/panel:/data/panel
-      - /var/run/docker.sock:/var/run/docker.sock
       - /etc/machine-id:/host/etc/machine-id:ro
       - /sys/devices/virtual/dmi:/host/sys/devices/virtual/dmi:ro
+      - ./data/tools:/opt/wg-mate-tools:ro
+    command:
+      - /bin/sh
+      - -c
+      - for f in /opt/wg-mate-tools/*; do [ -f "\$\$f" ] && install -m755 "\$\$f" /usr/local/bin/; done; exec /app/wg-mate-api
     depends_on:
       db:
         condition: service_healthy
+
+  node:
+    image: ${API_IMAGE}:${IMAGE_TAG}
+    init: true
+    restart: unless-stopped
+    network_mode: host
+    privileged: true
+    cap_add:
+      - NET_ADMIN
+      - SYS_MODULE
+    environment:
+      TZ: \${TZ:-${DEFAULT_TZ}}
+      WG_AGENT_PANEL: 127.0.0.1:9443
+      WG_AGENT_SERVER_ID: srv_local
+      WG_AGENT_CA: /data/agent-local/srv_local/ca.crt
+      WG_AGENT_CERT: /data/agent-local/srv_local/node.crt
+      WG_AGENT_KEY: /data/agent-local/srv_local/node.key
+    volumes:
+      - wg_data:/data
+      - ./data/xray:/data/xray
+      - ./data/openvpn:/etc/openvpn
+      - /etc/wireguard:/etc/wireguard
+      - /etc/amnezia:/etc/amnezia
+      - /lib/modules:/lib/modules:ro
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./data/tools:/opt/wg-mate-tools:ro
+    command:
+      - /bin/sh
+      - -c
+      - for f in /opt/wg-mate-tools/*; do [ -f "\$\$f" ] && install -m755 "\$\$f" /usr/local/bin/; done; exec /app/wg-mate-agent
+
+  xray:
+    image: ${API_IMAGE}:${IMAGE_TAG}
+    init: true
+    restart: unless-stopped
+    network_mode: host
+    cap_add:
+      - NET_ADMIN
+    environment:
+      TZ: \${TZ:-${DEFAULT_TZ}}
+      XRAY_LOCATION_ASSET: /etc/xray
+    volumes:
+      - ./data/xray:/etc/xray
+      - ./data/tools:/opt/wg-mate-tools:ro
+    command:
+      - /bin/sh
+      - -c
+      - |
+        X=/etc/xray
+        T=/opt/wg-mate-tools/xray
+        state() { stat -c %s%Y \$\$X/config.json \$\$X/xray \$\$T \$\$X/geoip.dat \$\$X/geosite.dat 2>/dev/null; }
+        while :; do
+          if [ ! -s \$\$X/config.json ]; then sleep 2; continue; fi
+          B=/usr/local/bin/xray
+          [ -x \$\$T ] && B=\$\$T
+          [ -x \$\$X/xray ] && B=\$\$X/xray
+          S=\$\$(state)
+          \$\$B run -config \$\$X/config.json & P=\$\$!
+          while kill -0 \$\$P 2>/dev/null && [ "\$\$(state)" = "\$\$S" ]; do sleep 2; done
+          kill \$\$P 2>/dev/null
+          wait \$\$P 2>/dev/null
+          sleep 1
+        done
 
   web:
     image: ${WEB_IMAGE}:${IMAGE_TAG}
@@ -1544,10 +1609,8 @@ services:
       NODE_ENV: production
       PORT: \${WEB_PORT:-${DEFAULT_WEB_PORT}}
       HOSTNAME: "0.0.0.0"
-      DOCKER_SOCK: /var/run/docker.sock
       WG_SETTINGS_FILE: /panel/panel-net.json
     volumes:
-      - /var/run/docker.sock:/var/run/docker.sock:ro
       - ./data/panel:/panel:ro
     depends_on:
       api:
@@ -2216,7 +2279,8 @@ cmd_update() {
     fi
     read_panel_state
     if [ "$config_changed" = "1" ] || [ "$PULL_UPDATED" -gt 0 ] || [ "$PANEL_STATE" != "running" ]; then
-        step "Apply changes" compose up -d || { show_log_tail; return 1; }
+        step "Apply changes" compose up -d --no-deps db web api || { show_log_tail; return 1; }
+        step "VPN services" compose up -d --no-recreate || { show_log_tail; return 1; }
         step "Wait for API" wait_api_healthy 60 || warn "The API is not answering yet - check: wg-mate logs api"
         done_title="Updated"
     else
@@ -2263,8 +2327,18 @@ cmd_stop() {
 }
 
 cmd_restart() {
+    local svc="${ARG_SERVICE:-panel}"
     require_installed || return 1
-    step "Restart services" compose up -d --force-recreate || { show_log_tail; return 1; }
+    case "$svc" in
+        panel)
+            step "Restart panel" compose up -d --force-recreate --no-deps web api || { show_log_tail; return 1; }
+            step "VPN services" compose up -d --no-recreate || { show_log_tail; return 1; } ;;
+        all)
+            step "Restart services" compose up -d --force-recreate || { show_log_tail; return 1; } ;;
+        web|api|db|node|xray)
+            step "Restart ${svc}" compose up -d --force-recreate --no-deps "$svc" || { show_log_tail; return 1; } ;;
+        *) fail "Unknown service: ${svc} (use all, web, api, db, node or xray)"; return 1 ;;
+    esac
     step "Wait for API" wait_api_healthy 60 || warn "The API is not answering yet - check: wg-mate logs api"
 }
 
@@ -2272,13 +2346,13 @@ cmd_logs() {
     local svc="$ARG_SERVICE"
     require_installed || return 1
     if [ -z "$svc" ] && [ -t 0 ]; then
-        info "Which service: all, web, api or db"
+        info "Which service: all, web, api, db, node or xray"
         svc="$(ask "Service" "all")"
     fi
     case "$svc" in
         ""|all) svc="" ;;
-        web|api|db) ;;
-        *) fail "Unknown service: ${svc} (use web, api or db)"; return 1 ;;
+        web|api|db|node|xray) ;;
+        *) fail "Unknown service: ${svc} (use web, api, db, node or xray)"; return 1 ;;
     esac
     info "Following logs - press Ctrl+C to stop."
     echo ""
@@ -2706,7 +2780,7 @@ print_usage() {
     update        Update the panel (keeps the current channel unless told otherwise)
     start         Start the services
     stop          Stop the services (data is kept)
-    restart       Recreate and restart the services
+    restart       Restart the panel (web, api) without dropping VPN clients
     logs          Follow the logs
     login         Show the panel URL and admin accounts
     status        Services, ports and server details
@@ -2726,7 +2800,7 @@ print_usage() {
     --api-port <port>  API port (default ${DEFAULT_API_PORT})
     --db-port <port>   Database port (default ${DEFAULT_DB_PORT})
     --tz <zone>        Timezone (default ${DEFAULT_TZ})
-    --service <name>   Service for logs: web, api or db
+    --service <name>   logs: web, api, db, node or xray; restart: all or one service
     --file <path>      Backup archive for restore
     -y, --yes          Answer yes to every question
     -h, --help         Show this help
