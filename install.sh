@@ -155,6 +155,7 @@ step() {
     shift
     : > "$NOTE_FILE"
     printf '\n### %s  %s\n' "$(date '+%F %T')" "$label" >> "$LOG_FILE"
+    [ "$IS_TTY" = "1" ] || printf '  … %s\n' "$label"
     "$@" >> "$LOG_FILE" 2>&1 &
     STEP_PID=$!
     trap on_interrupt INT TERM
@@ -503,9 +504,10 @@ latest_panel_version() {
     token="$(curl -fsSL --max-time 4 "https://ghcr.io/token?scope=repository:${repo}:pull&service=ghcr.io" 2>/dev/null \
         | grep -oE '"token"[[:space:]]*:[[:space:]]*"[^"]+"' | cut -d'"' -f4)"
     [ -n "$token" ] || return 1
-    v="$(curl -fsSL --max-time 5 -H "Authorization: Bearer ${token}" "https://ghcr.io/v2/${repo}/tags/list" 2>/dev/null \
-        | tr ',' '\n' | grep -oE '"v[0-9]+(\.[0-9]+)*"' | tr -d '"' | sort -V | tail -1)"
+    v="$(curl -fsSL --max-time 8 -H "Authorization: Bearer ${token}" "https://ghcr.io/v2/${repo}/tags/list?n=10000" 2>/dev/null \
+        | tr ',' '\n' | grep -oE '"v?[0-9]+\.[0-9]+\.[0-9]+"' | tr -d '"v' | sort -V | tail -1)"
     [ -n "$v" ] || return 1
+    v="v$v"
     printf '%s' "$v" > "$LATEST_CACHE"
     printf '%s' "$v"
 }
@@ -1308,7 +1310,16 @@ pull_error_is_fatal() {
 draw_pull_progress() {
     local cur="$1" tot="$2" done_layers="$3" layers="$4" speed="$5"
     local pct=0 width=20 filled i bar="" cur_txt tot_txt speed_txt eta_txt text
-    [ "$IS_TTY" = "1" ] || return 0
+    if [ "$IS_TTY" != "1" ]; then
+        [ "$tot" -gt 0 ] && [ $((SECONDS - ${PULL_PLAIN_AT:-0})) -ge 3 ] || return 0
+        PULL_PLAIN_AT=$SECONDS
+        pct=$(( cur * 100 / tot ))
+        [ "$pct" -gt 100 ] && pct=100
+        fmt_mb "$cur" cur_txt
+        fmt_mb "$tot" tot_txt
+        printf '       %s  %3d%%  %s / %s\n' "${PULL_REF:-image}" "$pct" "$cur_txt" "$tot_txt"
+        return 0
+    fi
     if [ "$layers" -eq 0 ]; then
         printf '%s       %sconnecting to %s…%s' "$CLR" "$C_DIM" "$PULL_REGISTRY" "$C_RESET"
         return 0
@@ -1356,6 +1367,7 @@ pull_one() {
     PULL_BYTES=0
     PULL_UPTODATE=0
     PULL_REGISTRY="$(registry_of "$ref")"
+    PULL_REF="${ref##*/}"
 
     if [ ! -S "$DOCKER_SOCK" ]; then
         out="$(docker pull "$ref" 2>&1)"
