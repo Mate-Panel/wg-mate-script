@@ -1528,11 +1528,6 @@ services:
       - ./data/panel:/data/panel
       - /etc/machine-id:/host/etc/machine-id:ro
       - /sys/devices/virtual/dmi:/host/sys/devices/virtual/dmi:ro
-      - ./data/tools:/opt/wg-mate-tools:ro
-    command:
-      - /bin/sh
-      - -c
-      - for f in /opt/wg-mate-tools/*; do [ -f "\$\$f" ] && install -m755 "\$\$f" /usr/local/bin/; done; exec /app/wg-mate-api
     depends_on:
       db:
         condition: service_healthy
@@ -1549,10 +1544,6 @@ services:
     environment:
       TZ: \${TZ:-${DEFAULT_TZ}}
       WG_AGENT_PANEL: 127.0.0.1:9443
-      WG_AGENT_SERVER_ID: srv_local
-      WG_AGENT_CA: /data/agent-local/srv_local/ca.crt
-      WG_AGENT_CERT: /data/agent-local/srv_local/node.crt
-      WG_AGENT_KEY: /data/agent-local/srv_local/node.key
     volumes:
       - wg_data:/data
       - ./data/xray:/data/xray
@@ -1561,11 +1552,10 @@ services:
       - /etc/amnezia:/etc/amnezia
       - /lib/modules:/lib/modules:ro
       - /var/run/docker.sock:/var/run/docker.sock
-      - ./data/tools:/opt/wg-mate-tools:ro
     command:
       - /bin/sh
       - -c
-      - for f in /opt/wg-mate-tools/*; do [ -f "\$\$f" ] && install -m755 "\$\$f" /usr/local/bin/; done; exec /app/wg-mate-agent
+      - until [ -s /data/agent-local/node-id ]; do sleep 2; done; I=\$\$(cat /data/agent-local/node-id); D=/data/agent-local/\$\$I; exec env WG_AGENT_SERVER_ID=\$\$I WG_AGENT_CA=\$\$D/ca.crt WG_AGENT_CERT=\$\$D/node.crt WG_AGENT_KEY=\$\$D/node.key /app/wg-mate-agent
 
   xray:
     image: ${API_IMAGE}:${IMAGE_TAG}
@@ -1579,18 +1569,15 @@ services:
       XRAY_LOCATION_ASSET: /etc/xray
     volumes:
       - ./data/xray:/etc/xray
-      - ./data/tools:/opt/wg-mate-tools:ro
     command:
       - /bin/sh
       - -c
       - |
         X=/etc/xray
-        T=/opt/wg-mate-tools/xray
-        state() { stat -c %s%Y \$\$X/config.json \$\$X/xray \$\$T \$\$X/geoip.dat \$\$X/geosite.dat 2>/dev/null; }
+        state() { stat -c %s%Y \$\$X/config.json \$\$X/xray \$\$X/geoip.dat \$\$X/geosite.dat 2>/dev/null; }
         while :; do
           if [ ! -s \$\$X/config.json ]; then sleep 2; continue; fi
           B=/usr/local/bin/xray
-          [ -x \$\$T ] && B=\$\$T
           [ -x \$\$X/xray ] && B=\$\$X/xray
           S=\$\$(state)
           \$\$B run -config \$\$X/config.json & P=\$\$!
