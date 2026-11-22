@@ -1,6 +1,6 @@
 #!/bin/bash
 
-SCRIPT_VERSION="0.3.3"
+SCRIPT_VERSION="0.3.4"
 GIT_REPO="Mate-Panel/wg-mate-script"
 SCRIPT_URL="https://raw.githubusercontent.com/${GIT_REPO}/main/install.sh"
 SCRIPT_API_URL="https://api.github.com/repos/${GIT_REPO}/contents/install.sh?ref=main"
@@ -17,6 +17,7 @@ API_IMAGE="ghcr.io/mate-panel/wg-mate-api"
 DB_IMAGE="postgres:16-alpine"
 DOCKER_SOCK="/var/run/docker.sock"
 DOCKER_HUB_MIRRORS="docker.arvancloud.ir hub.hamdocker.ir"
+HUB_NAMESPACE="wgmate"
 DNS_SERVERS=("1.1.1.1" "8.8.8.8" "9.9.9.9")
 LICENSE_PUBKEY="ksB0JTWOEQj2bZlG5s9zKeEfoqDo9nmf/a0JWOjuau4="
 
@@ -26,6 +27,8 @@ DEFAULT_DB_PORT="5433"
 DEFAULT_TZ="Asia/Tehran"
 
 IMAGE_TAG="latest"
+IMAGE_SOURCE="ghcr.io/mate-panel"
+IMAGE_SOURCE_HOST="ghcr.io"
 WEB_PORT="$DEFAULT_WEB_PORT"
 API_PORT="$DEFAULT_API_PORT"
 DB_PORT="$DEFAULT_DB_PORT"
@@ -1276,8 +1279,8 @@ PULL_UPDATED=0
 
 image_label() {
     case "$1" in
-        "$API_IMAGE"*) printf 'api' ;;
-        "$WEB_IMAGE"*) printf 'web' ;;
+        *wg-mate-api*) printf 'api' ;;
+        *wg-mate-web*) printf 'web' ;;
         *) printf 'db' ;;
     esac
 }
@@ -1301,6 +1304,116 @@ hub_mirror_refs() {
     for m in $DOCKER_HUB_MIRRORS; do
         printf '%s/%s\n' "$m" "$path"
     done
+}
+
+measure_source() {
+    local host="$1" repo="$2" tag="$3" arch base accept hdr status realm service scope token
+    local manifest digest layer_digest layers best_size size code speed
+    local auth=()
+    case "$(uname -m)" in
+        aarch64|arm64) arch="arm64" ;;
+        *) arch="amd64" ;;
+    esac
+    base="https://${host}/v2/${repo}"
+    accept="application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json"
+    hdr="$(curl -s -o /dev/null -D - --connect-timeout 4 --max-time 8 -H "Accept: $accept" "$base/manifests/$tag" 2>/dev/null)"
+    status="$(printf '%s\n' "$hdr" | grep -m1 -E '^HTTP/' | awk '{print $2}')"
+    if [ "$status" = "401" ]; then
+        realm="$(printf '%s\n' "$hdr" | grep -i -m1 '^www-authenticate:' | grep -oE 'realm="[^"]*"' | head -1 | cut -d'"' -f2)"
+        service="$(printf '%s\n' "$hdr" | grep -i -m1 '^www-authenticate:' | grep -oE 'service="[^"]*"' | head -1 | cut -d'"' -f2)"
+        scope="$(printf '%s\n' "$hdr" | grep -i -m1 '^www-authenticate:' | grep -oE 'scope="[^"]*"' | head -1 | cut -d'"' -f2)"
+        [ -n "$realm" ] || { printf '0'; return 0; }
+        token="$(curl -s --connect-timeout 4 --max-time 8 "${realm}?service=${service}&scope=${scope:-repository:${repo}:pull}" 2>/dev/null \
+            | grep -oE '"(token|access_token)"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | cut -d'"' -f4)"
+        [ -n "$token" ] || { printf '0'; return 0; }
+        auth=(-H "Authorization: Bearer $token")
+    fi
+    manifest="$(curl -s --connect-timeout 4 --max-time 8 "${auth[@]}" -H "Accept: $accept" "$base/manifests/$tag" 2>/dev/null | tr -d ' \n\r\t')"
+    [ -n "$manifest" ] || { printf '0'; return 0; }
+    if printf '%s' "$manifest" | grep -q '"manifests":\['; then
+        digest="$(printf '%s' "$manifest" | sed 's/.*"manifests":\[//' \
+            | grep -oE '\{[^{}]*\{[^{}]*\}[^{}]*\}' | grep "\"architecture\":\"${arch}\"" | head -1 \
+            | grep -oE '"digest":"sha256:[0-9a-f]+"' | head -1 | cut -d'"' -f4)"
+        [ -n "$digest" ] || { printf '0'; return 0; }
+        manifest="$(curl -s --connect-timeout 4 --max-time 8 "${auth[@]}" -H "Accept: $accept" "$base/manifests/$digest" 2>/dev/null | tr -d ' \n\r\t')"
+        [ -n "$manifest" ] || { printf '0'; return 0; }
+    fi
+    layers="$(printf '%s' "$manifest" | sed 's/.*"layers":\[//')"
+    best_size=0
+    layer_digest=""
+    while IFS= read -r size; do
+        [ -n "$size" ] || continue
+        if [ "$size" -gt "$best_size" ]; then
+            best_size="$size"
+            layer_digest="$(printf '%s' "$layers" | grep -oE '\{[^{}]*\}' | grep "\"size\":${size}[,}]" | head -1 \
+                | grep -oE '"digest":"sha256:[0-9a-f]+"' | head -1 | cut -d'"' -f4)"
+        fi
+    done < <(printf '%s' "$layers" | grep -oE '\{[^{}]*\}' | grep -oE '"size":[0-9]+' | cut -d: -f2)
+    [ -n "$layer_digest" ] || { printf '0'; return 0; }
+    read -r code speed <<<"$(curl -s -L --connect-timeout 4 --max-time 10 -r 0-4194303 "${auth[@]}" -o /dev/null \
+        -w '%{http_code} %{speed_download}' "$base/blobs/$layer_digest" 2>/dev/null)"
+    case "$code" in
+        200|206) printf '%d' "${speed%%.*}" ;;
+        *) printf '0' ;;
+    esac
+}
+
+pick_image_source() {
+    local tmp i=0 label host prefix pull speed best_speed=0 best_pull="" best_host="" line summary=""
+    local -a labels=() hosts=() pulls=() speeds=() pids=()
+    tmp="$(mktemp -d)" || return 0
+    while IFS=' ' read -r label host prefix pull; do
+        [ -n "$host" ] || continue
+        labels+=("$label"); hosts+=("$host"); pulls+=("$pull")
+        i=$((i + 1))
+        ( measure_source "$host" "$prefix/wg-mate-api" "$IMAGE_TAG" > "$tmp/$i" 2>/dev/null ) &
+        pids+=("$!")
+    done < <(
+        printf 'ghcr.io ghcr.io mate-panel ghcr.io/mate-panel\n'
+        printf 'docker.io registry-1.docker.io %s docker.io/%s\n' "$HUB_NAMESPACE" "$HUB_NAMESPACE"
+        for host in $DOCKER_HUB_MIRRORS; do
+            label="$(printf '%s' "$host" | awk -F. '{ if (NF >= 3) print $(NF-1); else print $0 }')"
+            printf '%s %s %s %s/%s\n' "$label" "$host" "$HUB_NAMESPACE" "$host" "$HUB_NAMESPACE"
+        done
+    )
+    wait "${pids[@]}"
+    for i in "${!labels[@]}"; do
+        speed="$(cat "$tmp/$((i + 1))" 2>/dev/null)"
+        case "$speed" in ''|*[!0-9]*) speed=0 ;; esac
+        speeds+=("$speed")
+        if [ "$speed" -gt "$best_speed" ]; then
+            best_speed="$speed"
+            best_pull="${pulls[i]}"
+            best_host="${hosts[i]}"
+        fi
+    done
+    rm -rf "$tmp"
+    if [ -n "$best_pull" ]; then
+        IMAGE_SOURCE="$best_pull"
+        IMAGE_SOURCE_HOST="$best_host"
+    else
+        IMAGE_SOURCE="ghcr.io/mate-panel"
+        IMAGE_SOURCE_HOST="ghcr.io"
+    fi
+    for i in "${!labels[@]}"; do
+        speed="${speeds[i]}"
+        if [ "$speed" -ge 1048576 ]; then
+            line="$(printf '%s %d.%d MB/s' "${labels[i]}" $((speed * 10 / 1048576 / 10)) $((speed * 10 / 1048576 % 10)))"
+        elif [ "$speed" -gt 0 ]; then
+            line="$(printf '%s %d KB/s' "${labels[i]}" $((speed / 1024)))"
+        else
+            line="${labels[i]} unreachable"
+        fi
+        if [ "${pulls[i]}" = "$IMAGE_SOURCE" ]; then
+            line="${C_OK}${line} ✔${C_RESET}"
+        else
+            line="${C_DIM}${line}${C_RESET}"
+        fi
+        [ -n "$summary" ] && summary="${summary} · "
+        summary="${summary}${line}"
+        printf '%s %s %s\n' "${labels[i]}" "${speeds[i]}" "${pulls[i]}" >> "$LOG_FILE"
+    done
+    printf '  %s⠿%s %-16s %s\n' "$C_ACCENT" "$C_RESET" "Source" "$summary"
 }
 
 pull_error_is_fatal() {
@@ -1522,15 +1635,35 @@ pull_image() {
 }
 
 pull_images() {
-    local refs=("${API_IMAGE}:${IMAGE_TAG}" "${WEB_IMAGE}:${IMAGE_TAG}" "$DB_IMAGE")
+    local refs=() canon=() db_src i rc
     local ref start=$SECONDS good=0 lines=0 took mark result
     PULL_UPDATED=0
+    pick_image_source
     TERM_COLS="$(tput cols 2>/dev/null || echo 80)"
     printf '\n### %s  Images\n' "$(date '+%F %T')" >> "$LOG_FILE"
     printf '  %s⠿%s %-16s %s%s%s\n' "$C_ACCENT" "$C_RESET" "Images" "$C_DIM" "$(channel_name "$IMAGE_TAG")" "$C_RESET"
-    for ref in "${refs[@]}"; do
-        pull_image "$ref" && good=$((good + 1))
+    refs+=("${IMAGE_SOURCE}/wg-mate-api:${IMAGE_TAG}")
+    canon+=("${API_IMAGE}:${IMAGE_TAG}")
+    refs+=("${IMAGE_SOURCE}/wg-mate-web:${IMAGE_TAG}")
+    canon+=("${WEB_IMAGE}:${IMAGE_TAG}")
+    db_src="$DB_IMAGE"
+    case " $DOCKER_HUB_MIRRORS " in
+        *" ${IMAGE_SOURCE_HOST} "*) db_src="${IMAGE_SOURCE_HOST}/library/${DB_IMAGE}" ;;
+    esac
+    refs+=("$db_src")
+    canon+=("$DB_IMAGE")
+    for i in "${!refs[@]}"; do
+        ref="${refs[i]}"
+        rc=1
+        pull_image "$ref" && rc=0
         lines=$((lines + PULL_LINES))
+        if [ "$rc" -eq 0 ] && [ "$ref" != "${canon[i]}" ]; then
+            docker tag "$ref" "${canon[i]}" >>"$LOG_FILE" 2>&1
+        elif [ "$rc" -ne 0 ] && [ "$ref" != "${canon[i]}" ]; then
+            pull_image "${canon[i]}" && rc=0
+            lines=$((lines + PULL_LINES))
+        fi
+        [ "$rc" -eq 0 ] && good=$((good + 1))
     done
     fmt_secs $((SECONDS - start)) took
     mark="${C_OK}✔${C_RESET}"
