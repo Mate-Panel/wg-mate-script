@@ -16,7 +16,7 @@ WEB_IMAGE="ghcr.io/mate-panel/wg-mate-web"
 API_IMAGE="ghcr.io/mate-panel/wg-mate-api"
 DB_IMAGE="postgres:16-alpine"
 DOCKER_SOCK="/var/run/docker.sock"
-DOCKER_HUB_MIRRORS="docker.arvancloud.ir hub.hamdocker.ir"
+DOCKER_HUB_MIRRORS="docker.arvancloud.ir hub.hamdocker.ir registry.docker.ir docker.iranserver.com docker.kernel.ir mirror.kargadan.ir docker.novin.cloud mirror-docker.runflare.com hub.mecan.ir docker-mirror.liara.ir"
 HUB_NAMESPACE="wgmate"
 DNS_SERVERS=("1.1.1.1" "8.8.8.8" "9.9.9.9")
 LICENSE_PUBKEY="ksB0JTWOEQj2bZlG5s9zKeEfoqDo9nmf/a0JWOjuau4="
@@ -1306,9 +1306,9 @@ hub_mirror_refs() {
     done
 }
 
-measure_source() {
+probe_source() {
     local host="$1" repo="$2" tag="$3" arch base accept hdr status realm service scope token
-    local manifest digest layer_digest layers best_size size code speed
+    local manifest digest layer_digest layers best_size size
     local auth=()
     case "$(uname -m)" in
         aarch64|arm64) arch="arm64" ;;
@@ -1322,21 +1322,21 @@ measure_source() {
         realm="$(printf '%s\n' "$hdr" | grep -i -m1 '^www-authenticate:' | grep -oE 'realm="[^"]*"' | head -1 | cut -d'"' -f2)"
         service="$(printf '%s\n' "$hdr" | grep -i -m1 '^www-authenticate:' | grep -oE 'service="[^"]*"' | head -1 | cut -d'"' -f2)"
         scope="$(printf '%s\n' "$hdr" | grep -i -m1 '^www-authenticate:' | grep -oE 'scope="[^"]*"' | head -1 | cut -d'"' -f2)"
-        [ -n "$realm" ] || { printf '0'; return 0; }
+        [ -n "$realm" ] || return 0
         token="$(curl -s --connect-timeout 4 --max-time 8 "${realm}?service=${service}&scope=${scope:-repository:${repo}:pull}" 2>/dev/null \
             | grep -oE '"(token|access_token)"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | cut -d'"' -f4)"
-        [ -n "$token" ] || { printf '0'; return 0; }
+        [ -n "$token" ] || return 0
         auth=(-H "Authorization: Bearer $token")
     fi
     manifest="$(curl -s --connect-timeout 4 --max-time 8 "${auth[@]}" -H "Accept: $accept" "$base/manifests/$tag" 2>/dev/null | tr -d ' \n\r\t')"
-    [ -n "$manifest" ] || { printf '0'; return 0; }
+    [ -n "$manifest" ] || return 0
     if printf '%s' "$manifest" | grep -q '"manifests":\['; then
         digest="$(printf '%s' "$manifest" | sed 's/.*"manifests":\[//' \
             | grep -oE '\{[^{}]*\{[^{}]*\}[^{}]*\}' | grep "\"architecture\":\"${arch}\"" | head -1 \
             | grep -oE '"digest":"sha256:[0-9a-f]+"' | head -1 | cut -d'"' -f4)"
-        [ -n "$digest" ] || { printf '0'; return 0; }
+        [ -n "$digest" ] || return 0
         manifest="$(curl -s --connect-timeout 4 --max-time 8 "${auth[@]}" -H "Accept: $accept" "$base/manifests/$digest" 2>/dev/null | tr -d ' \n\r\t')"
-        [ -n "$manifest" ] || { printf '0'; return 0; }
+        [ -n "$manifest" ] || return 0
     fi
     layers="$(printf '%s' "$manifest" | sed 's/.*"layers":\[//')"
     best_size=0
@@ -1349,9 +1349,16 @@ measure_source() {
                 | grep -oE '"digest":"sha256:[0-9a-f]+"' | head -1 | cut -d'"' -f4)"
         fi
     done < <(printf '%s' "$layers" | grep -oE '\{[^{}]*\}' | grep -oE '"size":[0-9]+' | cut -d: -f2)
-    [ -n "$layer_digest" ] || { printf '0'; return 0; }
-    read -r code speed <<<"$(curl -s -L --connect-timeout 4 --max-time 10 -r 0-4194303 "${auth[@]}" -o /dev/null \
-        -w '%{http_code} %{speed_download}' "$base/blobs/$layer_digest" 2>/dev/null)"
+    [ -n "$layer_digest" ] || return 0
+    printf '%s %s' "$layer_digest" "${token:--}"
+}
+
+blob_speed() {
+    local host="$1" repo="$2" digest="$3" token="$4" code speed
+    local auth=()
+    [ "$token" != "-" ] && auth=(-H "Authorization: Bearer $token")
+    read -r code speed <<<"$(curl -s -L --connect-timeout 4 --max-time 5 -r 0-2097151 "${auth[@]}" -o /dev/null \
+        -w '%{http_code} %{speed_download}' "https://${host}/v2/${repo}/blobs/${digest}" 2>/dev/null)"
     case "$code" in
         200|206) printf '%d' "${speed%%.*}" ;;
         *) printf '0' ;;
@@ -1360,26 +1367,32 @@ measure_source() {
 
 pick_image_source() {
     local tmp i=0 label host prefix pull speed best_speed=0 best_pull="" best_host="" line summary=""
-    local -a labels=() hosts=() pulls=() speeds=() pids=()
+    local probe digest token repo unreachable=0 chosen_line="" speed_txt
+    local -a labels=() hosts=() pulls=() repos=() speeds=() pids=() order=()
     tmp="$(mktemp -d)" || return 0
     while IFS=' ' read -r label host prefix pull; do
         [ -n "$host" ] || continue
-        labels+=("$label"); hosts+=("$host"); pulls+=("$pull")
+        labels+=("$label"); hosts+=("$host"); pulls+=("$pull"); repos+=("$prefix/wg-mate-api")
         i=$((i + 1))
-        ( measure_source "$host" "$prefix/wg-mate-api" "$IMAGE_TAG" > "$tmp/$i" 2>/dev/null ) &
+        ( probe_source "$host" "$prefix/wg-mate-api" "$IMAGE_TAG" > "$tmp/$i" 2>/dev/null ) &
         pids+=("$!")
     done < <(
         printf 'ghcr.io ghcr.io mate-panel ghcr.io/mate-panel\n'
         printf 'docker.io registry-1.docker.io %s docker.io/%s\n' "$HUB_NAMESPACE" "$HUB_NAMESPACE"
         for host in $DOCKER_HUB_MIRRORS; do
-            label="$(printf '%s' "$host" | awk -F. '{ if (NF >= 3) print $(NF-1); else print $0 }')"
+            label="$(printf '%s' "$host" | awk -F. '{ if (NF >= 3) { c = $(NF-1); if (c == "docker") print $(NF-1)"."$NF; else print c } else print $0 }')"
             printf '%s %s %s %s/%s\n' "$label" "$host" "$HUB_NAMESPACE" "$host" "$HUB_NAMESPACE"
         done
     )
     wait "${pids[@]}"
     for i in "${!labels[@]}"; do
-        speed="$(cat "$tmp/$((i + 1))" 2>/dev/null)"
-        case "$speed" in ''|*[!0-9]*) speed=0 ;; esac
+        probe="$(cat "$tmp/$((i + 1))" 2>/dev/null)"
+        speed=0
+        if [ -n "$probe" ]; then
+            read -r digest token <<<"$probe"
+            speed="$(blob_speed "${hosts[i]}" "${repos[i]}" "$digest" "$token")"
+            case "$speed" in ''|*[!0-9]*) speed=0 ;; esac
+        fi
         speeds+=("$speed")
         if [ "$speed" -gt "$best_speed" ]; then
             best_speed="$speed"
@@ -1403,16 +1416,30 @@ pick_image_source() {
             line="$(printf '%s %d KB/s' "${labels[i]}" $((speed / 1024)))"
         else
             line="${labels[i]} unreachable"
+            unreachable=$((unreachable + 1))
         fi
-        if [ "${pulls[i]}" = "$IMAGE_SOURCE" ]; then
-            line="${C_OK}${line} ✔${C_RESET}"
+        if [ "${pulls[i]}" = "$IMAGE_SOURCE" ] && [ -n "$best_pull" ]; then
+            chosen_line="${C_OK}${line} ✔${C_RESET}"
         else
-            line="${C_DIM}${line}${C_RESET}"
+            order+=("$speed|$i")
         fi
-        [ -n "$summary" ] && summary="${summary} · "
-        summary="${summary}${line}"
         printf '%s %s %s\n' "${labels[i]}" "${speeds[i]}" "${pulls[i]}" >> "$LOG_FILE"
     done
+    if [ -n "$chosen_line" ]; then
+        summary="$chosen_line"
+        while IFS='|' read -r speed i; do
+            [ "$speed" -gt 0 ] || continue
+            if [ "$speed" -ge 1048576 ]; then
+                speed_txt="$(printf '%d.%d MB/s' $((speed * 10 / 1048576 / 10)) $((speed * 10 / 1048576 % 10)))"
+            else
+                speed_txt="$(printf '%d KB/s' $((speed / 1024)))"
+            fi
+            summary="${summary} · ${C_DIM}${labels[i]} ${speed_txt}${C_RESET}"
+        done < <(printf '%s\n' "${order[@]}" | sort -t'|' -k1,1nr)
+        [ "$unreachable" -gt 0 ] && summary="${summary} · ${C_DIM}${unreachable} unreachable${C_RESET}"
+    else
+        summary="${C_DIM}ghcr.io (no source answered the speed test)${C_RESET}"
+    fi
     printf '  %s⠿%s %-16s %s\n' "$C_ACCENT" "$C_RESET" "Source" "$summary"
 }
 
